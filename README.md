@@ -2,6 +2,19 @@
 
 ## What's New
 
+### May 12, 2020
+* Add ResNeSt models (code adapted from https://github.com/zhanghang1989/ResNeSt, paper https://arxiv.org/abs/2004.08955))
+
+### May 3, 2020
+* Pruned EfficientNet B1, B2, and B3 (https://arxiv.org/abs/2002.08258) contributed by [Yonathan Aflalo](https://github.com/yoniaflalo)
+
+### May 1, 2020
+* Merged a number of execellent contributions in the ResNet model family over the past month
+  * BlurPool2D and resnetblur models initiated by [Chris Ha](https://github.com/VRandme), I trained resnetblur50 to 79.3.
+  * TResNet models and SpaceToDepth, AntiAliasDownsampleLayer layers by [mrT23](https://github.com/mrT23)
+  * ecaresnet (50d, 101d, light) models and two pruned variants using pruning as per (https://arxiv.org/abs/2002.08258) by [Yonathan Aflalo](https://github.com/yoniaflalo)
+* 200 pretrained models in total now with updated results csv in results folder
+
 ### April 5, 2020
 * Add some newly trained MobileNet-V2 models trained with latest h-params, rand augment. They compare quite favourably to EfficientNet-Lite
   * 3.5M param MobileNet-V2 100 @ 73%
@@ -60,41 +73,6 @@
 * Add RandAugment trained EfficientNet-B0 weight with 77.7 top-1. Trained by [Michael Klachko](https://github.com/michaelklachko) with this code and recent hparams (see Training section)
 * Add `avg_checkpoints.py` script for post training weight averaging and update all scripts with header docstrings and shebangs.
 
-### Dec 30, 2019
-* Merge [Dushyant Mehta's](https://github.com/mehtadushy) PR for SelecSLS (Selective Short and Long Range Skip Connections) networks. Good GPU memory consumption and throughput. Original: https://github.com/mehtadushy/SelecSLS-Pytorch
-
-### Dec 28, 2019
-* Add new model weights and training hparams (see Training Hparams section)
-  * `efficientnet_b3` - 81.5 top-1, 95.7 top-5 at default res/crop, 81.9, 95.8 at 320x320 1.0 crop-pct
-     * trained with RandAugment, ended up with an interesting but less than perfect result (see training section)
-  * `seresnext26d_32x4d`- 77.6 top-1, 93.6 top-5
-     * deep stem (32, 32, 64), avgpool downsample
-     * stem/dowsample from bag-of-tricks paper
-  * `seresnext26t_32x4d`- 78.0 top-1, 93.7 top-5
-     * deep tiered stem (24, 48, 64), avgpool downsample (a modified 'D' variant)
-     * stem sizing mods from Jeremy Howard and fastai devs discussing ResNet architecture experiments
-
-### Dec 23, 2019
-* Add RandAugment trained MixNet-XL weights with 80.48 top-1.
-* `--dist-bn` argument added to train.py, will distribute BN stats between nodes after each train epoch, before eval
-
-### Dec 4, 2019
-* Added weights from the first training from scratch of an EfficientNet (B2) with my new RandAugment implementation. Much better than my previous B2 and very close to the official AdvProp ones (80.4 top-1, 95.08 top-5).
-
-### Nov 29, 2019
-* Brought EfficientNet and MobileNetV3 up to date with my https://github.com/rwightman/gen-efficientnet-pytorch code. Torchscript and ONNX export compat excluded.
-  * AdvProp weights added
-  * Official TF MobileNetv3 weights added
-* EfficientNet and MobileNetV3 hook based 'feature extraction' classes added. Will serve as basis for using models as backbones in obj detection/segmentation tasks. Lots more to be done here...
-* HRNet classification models and weights added from https://github.com/HRNet/HRNet-Image-Classification
-* Consistency in global pooling, `reset_classifer`, and `forward_features` across models
-  * `forward_features` always returns unpooled feature maps now
-* Reasonable chance I broke something... let me know
-
-### Nov 22, 2019
-* Add ImageNet training RandAugment implementation alongside AutoAugment. PyTorch Transform compatible format, using PIL. Currently training two EfficientNet models from scratch with promising results... will update.
-* `drop-connect` cmd line arg finally added to `train.py`, no need to hack model fns. Works for efficientnet/mobilenetv3 based models, ignored otherwise.
-
 ## Introduction 
 
 For each competition, personal, or freelance project involving images + Convolution Neural Networks, I build on top of an evolving collection of code and models. This repo contains a (somewhat) cleaned up and paired down iteration of that code. Hopefully it'll be of use to others.
@@ -120,6 +98,7 @@ Included models:
     * Instagram trained / ImageNet tuned ResNeXt101-32x8d to 32x48d from from [facebookresearch](https://pytorch.org/hub/facebookresearch_WSL-Images_resnext/)
     * Res2Net (https://github.com/gasvn/Res2Net, https://arxiv.org/abs/1904.01169)
     * Selective Kernel (SK) Nets (https://arxiv.org/abs/1903.06586)
+    * ResNeSt (code adapted from https://github.com/zhanghang1989/ResNeSt, paper https://arxiv.org/abs/2004.08955)
 * DLA
     * Original (https://github.com/ucbdrive/dla, https://arxiv.org/abs/1707.06484)
     * Res2Net (https://github.com/gasvn/Res2Net, https://arxiv.org/abs/1904.01169)
@@ -149,6 +128,8 @@ Included models:
     * code from https://github.com/HRNet/HRNet-Image-Classification, paper https://arxiv.org/abs/1908.07919
 * SelecSLS
     * code from https://github.com/mehtadushy/SelecSLS-Pytorch, paper https://arxiv.org/abs/1907.00837
+* TResNet
+    * code from https://github.com/mrT23/TResNet, paper https://arxiv.org/abs/2003.13630
 
 Use the  `--model` arg to specify model for train, validation, inference scripts. Match the all lowercase
 creation fn for the model you'd like.

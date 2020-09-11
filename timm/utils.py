@@ -1,3 +1,8 @@
+""" Common training and validation utilities
+
+Hacked together by / Copyright 2020 Ross Wightman
+"""
+
 from copy import deepcopy
 
 import torch
@@ -9,6 +14,7 @@ import glob
 import csv
 import operator
 import logging
+import logging.handlers
 import numpy as np
 from collections import OrderedDict
 try:
@@ -21,6 +27,9 @@ except ImportError:
 from torch import distributed as dist
 
 
+_logger = logging.getLogger(__name__)
+
+
 def unwrap_model(model):
     if isinstance(model, ModelEma):
         return unwrap_model(model.ema)
@@ -28,19 +37,67 @@ def unwrap_model(model):
         return model.module if hasattr(model, 'module') else model
 
 
-def get_state_dict(model):
-    return unwrap_model(model).state_dict()
+def get_state_dict(model, unwrap_fn=unwrap_model):
+    return unwrap_fn(model).state_dict()
+
+
+class ApexScaler:
+    state_dict_key = "amp"
+
+    def __call__(self, loss, optimizer):
+        with amp.scale_loss(loss, optimizer) as scaled_loss:
+            scaled_loss.backward()
+        optimizer.step()
+
+    def state_dict(self):
+        if 'state_dict' in amp.__dict__:
+            return amp.state_dict()
+
+    def load_state_dict(self, state_dict):
+        if 'load_state_dict' in amp.__dict__:
+            amp.load_state_dict(state_dict)
+
+
+class NativeScaler:
+    state_dict_key = "amp_scaler"
+
+    def __init__(self):
+        self._scaler = torch.cuda.amp.GradScaler()
+
+    def __call__(self, loss, optimizer):
+        self._scaler.scale(loss).backward()
+        self._scaler.step(optimizer)
+        self._scaler.update()
+
+    def state_dict(self):
+        return self._scaler.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self._scaler.load_state_dict(state_dict)
 
 
 class CheckpointSaver:
     def __init__(
             self,
+            model,
+            optimizer,
+            args=None,
+            model_ema=None,
+            amp_scaler=None,
             checkpoint_prefix='checkpoint',
             recovery_prefix='recovery',
             checkpoint_dir='',
             recovery_dir='',
             decreasing=False,
-            max_history=10):
+            max_history=10,
+            unwrap_fn=unwrap_model):
+
+        # objects to save state_dicts of
+        self.model = model
+        self.optimizer = optimizer
+        self.args = args
+        self.model_ema = model_ema
+        self.amp_scaler = amp_scaler
 
         # state
         self.checkpoint_files = []  # (filename, metric) tuples in order of decreasing betterness
@@ -58,13 +115,14 @@ class CheckpointSaver:
         self.decreasing = decreasing  # a lower metric is better if True
         self.cmp = operator.lt if decreasing else operator.gt  # True if lhs better than rhs
         self.max_history = max_history
+        self.unwrap_fn = unwrap_fn
         assert self.max_history >= 1
 
-    def save_checkpoint(self, model, optimizer, args, epoch, model_ema=None, metric=None, use_amp=False):
+    def save_checkpoint(self, epoch, metric=None):
         assert epoch >= 0
         tmp_save_path = os.path.join(self.checkpoint_dir, 'tmp' + self.extension)
         last_save_path = os.path.join(self.checkpoint_dir, 'last' + self.extension)
-        self._save(tmp_save_path, model, optimizer, args, epoch, model_ema, metric, use_amp)
+        self._save(tmp_save_path, epoch, metric)
         if os.path.exists(last_save_path):
             os.unlink(last_save_path) # required for Windows support.
         os.rename(tmp_save_path, last_save_path)
@@ -84,7 +142,7 @@ class CheckpointSaver:
             checkpoints_str = "Current checkpoints:\n"
             for c in self.checkpoint_files:
                 checkpoints_str += ' {}\n'.format(c)
-            logging.info(checkpoints_str)
+            _logger.info(checkpoints_str)
 
             if metric is not None and (self.best_metric is None or self.cmp(metric, self.best_metric)):
                 self.best_epoch = epoch
@@ -96,19 +154,21 @@ class CheckpointSaver:
 
         return (None, None) if self.best_metric is None else (self.best_metric, self.best_epoch)
 
-    def _save(self, save_path, model, optimizer, args, epoch, model_ema=None, metric=None, use_amp=False):
+    def _save(self, save_path, epoch, metric=None):
         save_state = {
             'epoch': epoch,
-            'arch': args.model,
-            'state_dict': get_state_dict(model),
-            'optimizer': optimizer.state_dict(),
-            'args': args,
+            'arch': type(self.model).__name__.lower(),
+            'state_dict': get_state_dict(self.model, self.unwrap_fn),
+            'optimizer': self.optimizer.state_dict(),
             'version': 2,  # version < 2 increments epoch before save
         }
-        if use_amp and 'state_dict' in amp.__dict__:
-            save_state['amp'] = amp.state_dict()
-        if model_ema is not None:
-            save_state['state_dict_ema'] = get_state_dict(model_ema)
+        if self.args is not None:
+            save_state['arch'] = self.args.model
+            save_state['args'] = self.args
+        if self.amp_scaler is not None:
+            save_state[self.amp_scaler.state_dict_key] = self.amp_scaler.state_dict()
+        if self.model_ema is not None:
+            save_state['state_dict_ema'] = get_state_dict(self.model_ema, self.unwrap_fn)
         if metric is not None:
             save_state['metric'] = metric
         torch.save(save_state, save_path)
@@ -121,23 +181,23 @@ class CheckpointSaver:
         to_delete = self.checkpoint_files[delete_index:]
         for d in to_delete:
             try:
-                logging.debug("Cleaning checkpoint: {}".format(d))
+                _logger.debug("Cleaning checkpoint: {}".format(d))
                 os.remove(d[0])
             except Exception as e:
-                logging.error("Exception '{}' while deleting checkpoint".format(e))
+                _logger.error("Exception '{}' while deleting checkpoint".format(e))
         self.checkpoint_files = self.checkpoint_files[:delete_index]
 
-    def save_recovery(self, model, optimizer, args, epoch, model_ema=None, use_amp=False, batch_idx=0):
+    def save_recovery(self, epoch, batch_idx=0):
         assert epoch >= 0
         filename = '-'.join([self.recovery_prefix, str(epoch), str(batch_idx)]) + self.extension
         save_path = os.path.join(self.recovery_dir, filename)
-        self._save(save_path, model, optimizer, args, epoch, model_ema, use_amp=use_amp)
+        self._save(save_path, epoch)
         if os.path.exists(self.last_recovery_file):
             try:
-                logging.debug("Cleaning recovery: {}".format(self.last_recovery_file))
+                _logger.debug("Cleaning recovery: {}".format(self.last_recovery_file))
                 os.remove(self.last_recovery_file)
             except Exception as e:
-                logging.error("Exception '{}' while removing {}".format(e, self.last_recovery_file))
+                _logger.error("Exception '{}' while removing {}".format(e, self.last_recovery_file))
         self.last_recovery_file = self.curr_recovery_file
         self.curr_recovery_file = save_path
 
@@ -279,9 +339,9 @@ class ModelEma:
                     name = k
                 new_state_dict[name] = v
             self.ema.load_state_dict(new_state_dict)
-            logging.info("Loaded state_dict_ema")
+            _logger.info("Loaded state_dict_ema")
         else:
-            logging.warning("Failed to find state_dict_ema, starting from loaded model weights")
+            _logger.warning("Failed to find state_dict_ema, starting from loaded model weights")
 
     def update(self, model):
         # correct a mismatch in state dict keys
@@ -307,8 +367,34 @@ class FormatterNoInfo(logging.Formatter):
         return logging.Formatter.format(self, record)
 
 
-def setup_default_logging(default_level=logging.INFO):
+def setup_default_logging(default_level=logging.INFO, log_path=''):
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(FormatterNoInfo())
     logging.root.addHandler(console_handler)
     logging.root.setLevel(default_level)
+    if log_path:
+        file_handler = logging.handlers.RotatingFileHandler(log_path, maxBytes=(1024 ** 2 * 2), backupCount=3)
+        file_formatter = logging.Formatter("%(asctime)s - %(name)20s: [%(levelname)8s] - %(message)s")
+        file_handler.setFormatter(file_formatter)
+        logging.root.addHandler(file_handler)
+
+
+def add_bool_arg(parser, name, default=False, help=''):
+    dest_name = name.replace('-', '_')
+    group = parser.add_mutually_exclusive_group(required=False)
+    group.add_argument('--' + name, dest=dest_name, action='store_true', help=help)
+    group.add_argument('--no-' + name, dest=dest_name, action='store_false', help=help)
+    parser.set_defaults(**{dest_name: default})
+
+
+def set_jit_legacy():
+    """ Set JIT executor to legacy w/ support for op fusion
+    This is hopefully a temporary need in 1.5/1.5.1/1.6 to restore performance due to changes
+    in the JIT exectutor. These API are not supported so could change.
+    """
+    #
+    assert hasattr(torch._C, '_jit_set_profiling_executor'), "Old JIT behavior doesn't exist!"
+    torch._C._jit_set_profiling_executor(False)
+    torch._C._jit_set_profiling_mode(False)
+    torch._C._jit_override_can_fuse_on_gpu(True)
+    #torch._C._jit_set_texpr_fuser_enabled(True)

@@ -2,7 +2,7 @@
 
 Paper: Selective Kernel Networks (https://arxiv.org/abs/1903.06586)
 
-Hacked together by Ross Wightman
+Hacked together by / Copyright 2020 Ross Wightman
 """
 import torch
 from torch import nn as nn
@@ -27,7 +27,6 @@ class SelectiveKernelAttn(nn.Module):
         """
         super(SelectiveKernelAttn, self).__init__()
         self.num_paths = num_paths
-        self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc_reduce = nn.Conv2d(channels, attn_channels, kernel_size=1, bias=False)
         self.bn = norm_layer(attn_channels)
         self.act = act_layer(inplace=True)
@@ -35,8 +34,7 @@ class SelectiveKernelAttn(nn.Module):
 
     def forward(self, x):
         assert x.shape[1] == self.num_paths
-        x = torch.sum(x, dim=1)
-        x = self.pool(x)
+        x = x.sum(1).mean((2, 3), keepdim=True)
         x = self.fc_reduce(x)
         x = self.bn(x)
         x = self.act(x)

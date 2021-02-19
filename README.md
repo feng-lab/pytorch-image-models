@@ -2,6 +2,83 @@
 
 ## What's New
 
+### Feb 18, 2021
+* Add pretrained weights and model variants for NFNet-F* models from [DeepMind Haiku impl](https://github.com/deepmind/deepmind-research/tree/master/nfnets).
+  * Models are prefixed with `dm_`. They require SAME padding conv, skipinit enabled, and activation gains applied in act fn.
+  * These models are big, expect to run out of GPU memory. With the GELU activiation + other options, they are roughly 1/2 the inference speed of my SiLU PyTorch optimized `s` variants.
+  * Original model results are based on pre-processing that is not the same as all other models so you'll see different results in the results csv (once updated).
+  * Matching the original pre-processing as closely as possible I get these results:
+    * `dm_nfnet_f6` - 86.352
+    * `dm_nfnet_f5` - 86.100
+    * `dm_nfnet_f4` - 85.834
+    * `dm_nfnet_f3` - 85.676
+    * `dm_nfnet_f2` - 85.178
+    * `dm_nfnet_f1` - 84.696
+    * `dm_nfnet_f0` - 83.464
+
+### Feb 16, 2021
+* Add Adaptive Gradient Clipping (AGC) as per https://arxiv.org/abs/2102.06171. Integrated w/ PyTorch gradient clipping via mode arg that defaults to prev 'norm' mode. For backward arg compat, clip-grad arg must be specified to enable when using train.py.
+  * AGC w/ default clipping factor `--clip-grad .01 --clip-mode agc`
+  * PyTorch global norm of 1.0 (old behaviour, always norm), `--clip-grad 1.0`
+  * PyTorch value clipping of 10, `--clip-grad 10. --clip-mode value`
+  * AGC performance is definitely sensitive to the clipping factor. More experimentation needed to determine good values for smaller batch sizes and optimizers besides those in paper. So far I've found .001-.005 is necessary for stable RMSProp training w/ NFNet/NF-ResNet.
+
+### Feb 12, 2021
+* Update Normalization-Free nets to include new NFNet-F (https://arxiv.org/abs/2102.06171) model defs
+
+### Feb 10, 2021
+* First Normalization-Free model training experiments done,
+  * nf_resnet50 - 80.68 top-1 @ 288x288, 80.31 @ 256x256
+  * nf_regnet_b1 - 79.30 @ 288x288, 78.75 @ 256x256
+* More model archs, incl a flexible ByobNet backbone ('Bring-your-own-blocks')
+  * GPU-Efficient-Networks (https://github.com/idstcv/GPU-Efficient-Networks), impl in `byobnet.py`
+  * RepVGG (https://github.com/DingXiaoH/RepVGG), impl in `byobnet.py`
+  * classic VGG (from torchvision, impl in `vgg.py`)
+* Refinements to normalizer layer arg handling and normalizer+act layer handling in some models
+* Default AMP mode changed to native PyTorch AMP instead of APEX. Issues not being fixed with APEX. Native works with `--channels-last` and `--torchscript` model training, APEX does not.
+* Fix a few bugs introduced since last pypi release
+
+### Feb 8, 2021
+* Add several ResNet weights with ECA attention. 26t & 50t trained @ 256, test @ 320. 269d train @ 256, fine-tune @320, test @ 352.
+  * `ecaresnet26t` - 79.88 top-1 @ 320x320, 79.08 @ 256x256
+  * `ecaresnet50t` - 82.35 top-1 @ 320x320, 81.52 @ 256x256
+  * `ecaresnet269d` - 84.93 top-1 @ 352x352, 84.87 @ 320x320
+* Remove separate tiered (`t`) vs tiered_narrow (`tn`) ResNet model defs, all `tn` changed to `t` and `t` models removed (`seresnext26t_32x4d` only model w/ weights that was removed).
+* Support model default_cfgs with separate train vs test resolution `test_input_size` and remove extra `_320` suffix ResNet model defs that were just for test.
+
+### Jan 30, 2021
+* Add initial "Normalization Free" NF-RegNet-B* and NF-ResNet model definitions based on [paper](https://arxiv.org/abs/2101.08692)
+
+### Jan 25, 2021
+* Add ResNetV2 Big Transfer (BiT) models w/ ImageNet-1k and 21k weights from https://github.com/google-research/big_transfer
+* Add official R50+ViT-B/16 hybrid models + weights from https://github.com/google-research/vision_transformer
+* ImageNet-21k ViT weights are added w/ model defs and representation layer (pre logits) support
+  * NOTE: ImageNet-21k classifier heads were zero'd in original weights, they are only useful for transfer learning
+* Add model defs and weights for DeiT Vision Transformer models from https://github.com/facebookresearch/deit
+* Refactor dataset classes into ImageDataset/IterableImageDataset + dataset specific parser classes
+* Add Tensorflow-Datasets (TFDS) wrapper to allow use of TFDS image classification sets with train script
+  * Ex: `train.py /data/tfds --dataset tfds/oxford_iiit_pet --val-split test --model resnet50 -b 256 --amp --num-classes 37 --opt adamw --lr 3e-4 --weight-decay .001 --pretrained -j 2`
+* Add improved .tar dataset parser that reads images from .tar, folder of .tar files, or .tar within .tar
+  * Run validation on full ImageNet-21k directly from tar w/ BiT model: `validate.py /data/fall11_whole.tar --model resnetv2_50x1_bitm_in21k --amp`
+* Models in this update should be stable w/ possible exception of ViT/BiT, possibility of some regressions with train/val scripts and dataset handling
+
+### Jan 3, 2021
+* Add SE-ResNet-152D weights
+  * 256x256 val, 0.94 crop top-1 - 83.75
+  * 320x320 val, 1.0 crop - 84.36
+* Update [results files](results/)
+
+### Dec 18, 2020
+* Add ResNet-101D, ResNet-152D, and ResNet-200D weights trained @ 256x256
+  * 256x256 val, 0.94 crop (top-1) - 101D (82.33), 152D (83.08), 200D (83.25)
+  * 288x288 val, 1.0 crop - 101D (82.64), 152D (83.48), 200D (83.76)
+  * 320x320 val, 1.0 crop - 101D (83.00), 152D (83.66), 200D (84.01)
+
+### Dec 7, 2020
+* Simplify EMA module (ModelEmaV2), compatible with fully torchscripted models
+* Misc fixes for SiLU ONNX export, default_cfg missing from Feature extraction models, Linear layer w/ AMP + torchscript
+* PyPi release @ 0.3.2 (needed by EfficientDet)
+
 ### Oct 30, 2020
 * Test with PyTorch 1.7 and fix a small top-n metric view vs reshape issue.
 * Convert newly added 224x224 Vision Transformer weights from official JAX repo. 81.8 top-1 for B/16, 83.1 L/16.
@@ -77,30 +154,6 @@ Bunch of changes:
 * Some import cleanup and classifier reset changes, all models will have classifier reset to nn.Identity on reset_classifer(0) call
 * Prep for 0.1.28 pip release
 
-### May 12, 2020
-* Add ResNeSt models (code adapted from https://github.com/zhanghang1989/ResNeSt, paper https://arxiv.org/abs/2004.08955))
-
-### May 3, 2020
-* Pruned EfficientNet B1, B2, and B3 (https://arxiv.org/abs/2002.08258) contributed by [Yonathan Aflalo](https://github.com/yoniaflalo)
-
-### May 1, 2020
-* Merged a number of execellent contributions in the ResNet model family over the past month
-  * BlurPool2D and resnetblur models initiated by [Chris Ha](https://github.com/VRandme), I trained resnetblur50 to 79.3.
-  * TResNet models and SpaceToDepth, AntiAliasDownsampleLayer layers by [mrT23](https://github.com/mrT23)
-  * ecaresnet (50d, 101d, light) models and two pruned variants using pruning as per (https://arxiv.org/abs/2002.08258) by [Yonathan Aflalo](https://github.com/yoniaflalo)
-* 200 pretrained models in total now with updated results csv in results folder
-
-### April 5, 2020
-* Add some newly trained MobileNet-V2 models trained with latest h-params, rand augment. They compare quite favourably to EfficientNet-Lite
-  * 3.5M param MobileNet-V2 100 @ 73%
-  * 4.5M param MobileNet-V2 110d @ 75%
-  * 6.1M param MobileNet-V2 140 @ 76.5%
-  * 5.8M param MobileNet-V2 120d @ 77.3%
-
-### March 18, 2020
-* Add EfficientNet-Lite models w/ weights ported from [Tensorflow TPU](https://github.com/tensorflow/tpu/tree/master/models/official/efficientnet/lite)
-* Add RandAugment trained ResNeXt-50 32x4d weights with 79.8 top-1. Trained by [Andrew Lavin](https://github.com/andravin) (see Training section for hparams)
-
 ## Introduction
 
 Py**T**orch **Im**age **M**odels (`timm`) is a collection of image models, layers, utilities, optimizers, schedulers, data-loaders / augmentations, and reference training / validation scripts that aim to pull together a wide variety of SOTA models with ability to reproduce ImageNet training results.
@@ -109,11 +162,13 @@ The work of many others is present here. I've tried to make sure all source mate
 
 ## Models
 
-All model architecture families include variants with pretrained weights. The are variants without any weights. Help training new or better weights is always appreciated. Here are some example [training hparams](https://rwightman.github.io/pytorch-image-models/training_hparam_examples) to get you started.
+All model architecture families include variants with pretrained weights. There are specific model variants without any weights, it is NOT a bug. Help training new or better weights is always appreciated. Here are some example [training hparams](https://rwightman.github.io/pytorch-image-models/training_hparam_examples) to get you started.
 
 A full version of the list below with source links can be found in the [documentation](https://rwightman.github.io/pytorch-image-models/models/).
 
+* Big Transfer ResNetV2 (BiT) - https://arxiv.org/abs/1912.11370
 * CspNet (Cross-Stage Partial Networks) - https://arxiv.org/abs/1911.11929
+* DeiT (Vision Transformer) - https://arxiv.org/abs/2012.12877
 * DenseNet - https://arxiv.org/abs/1608.06993
 * DLA - https://arxiv.org/abs/1707.06484
 * DPN (Dual-Path Network) - https://arxiv.org/abs/1707.01629
@@ -127,13 +182,17 @@ A full version of the list below with source links can be found in the [document
     * MNASNet B1, A1 (Squeeze-Excite), and Small - https://arxiv.org/abs/1807.11626
     * MobileNet-V2 - https://arxiv.org/abs/1801.04381
     * Single-Path NAS - https://arxiv.org/abs/1904.02877
+* GPU-Efficient Networks - https://arxiv.org/abs/2006.14090
 * HRNet - https://arxiv.org/abs/1908.07919
 * Inception-V3 - https://arxiv.org/abs/1512.00567
 * Inception-ResNet-V2 and Inception-V4 - https://arxiv.org/abs/1602.07261
 * MobileNet-V3 (MBConvNet w/ Efficient Head) - https://arxiv.org/abs/1905.02244
 * NASNet-A - https://arxiv.org/abs/1707.07012
+* NFNet-F - https://arxiv.org/abs/2102.06171
+* NF-RegNet / NF-ResNet - https://arxiv.org/abs/2101.08692
 * PNasNet - https://arxiv.org/abs/1712.00559
 * RegNet - https://arxiv.org/abs/2003.13678
+* RepVGG - https://arxiv.org/abs/2101.03697
 * ResNet/ResNeXt
     * ResNet (v1b/v1.5) - https://arxiv.org/abs/1512.03385
     * ResNeXt - https://arxiv.org/abs/1611.05431
@@ -200,6 +259,7 @@ Several (less common) features that I often utilize in my projects are included.
 * Efficient Channel Attention - ECA (https://arxiv.org/abs/1910.03151)
 * Blur Pooling (https://arxiv.org/abs/1904.11486)
 * Space-to-Depth by [mrT23](https://github.com/mrT23/TResNet/blob/master/src/models/tresnet/layers/space_to_depth.py) (https://arxiv.org/abs/1801.04590) -- original paper?
+* Adaptive Gradient Clipping (https://arxiv.org/abs/2102.06171, https://github.com/deepmind/deepmind-research/tree/master/nfnets)
 
 ## Results
 
@@ -217,21 +277,24 @@ The root folder of the repository contains reference train, validation, and infe
 
 One of the greatest assets of PyTorch is the community and their contributions. A few of my favourite resources that pair well with the models and componenets here are listed below.
 
-### Training / Frameworks
-* PyTorch Lightning - https://github.com/PyTorchLightning/pytorch-lightning
-* fastai - https://github.com/fastai/fastai
+### Object Detection, Instance and Semantic Segmentation
+* Detectron2 - https://github.com/facebookresearch/detectron2
+* Segmentation Models (Semantic) - https://github.com/qubvel/segmentation_models.pytorch
+* EfficientDet (Obj Det, Semantic soon) - https://github.com/rwightman/efficientdet-pytorch
 
 ### Computer Vision / Image Augmentation
 * Albumentations - https://github.com/albumentations-team/albumentations
 * Kornia - https://github.com/kornia/kornia
 
+### Knowledge Distillation
+* RepDistiller - https://github.com/HobbitLong/RepDistiller
+* torchdistill - https://github.com/yoshitomo-matsubara/torchdistill
+
 ### Metric Learning
 * PyTorch Metric Learning - https://github.com/KevinMusgrave/pytorch-metric-learning
 
-### Object Detection, Instance and Semantic Segmentation
-* Detectron2 - https://github.com/facebookresearch/detectron2
-* Segmentation Models (Semantic) - https://github.com/qubvel/segmentation_models.pytorch/issues
-* EfficientDet (Obj Det, Semantic soon) - https://github.com/rwightman/efficientdet-pytorch
+### Training / Frameworks
+* fastai - https://github.com/fastai/fastai
 
 ## Licenses
 
@@ -244,3 +307,22 @@ So far all of the pretrained weights available here are pretrained on ImageNet w
 #### Pretrained on more than ImageNet
 Several weights included or references here were pretrained with proprietary datasets that I do not have access to. These include the Facebook WSL, SSL, SWSL ResNe(Xt) and the Google Noisy Student EfficientNet models. The Facebook models have an explicit non-commercial license (CC-BY-NC 4.0, https://github.com/facebookresearch/semi-supervised-ImageNet1K-models, https://github.com/facebookresearch/WSL-Images). The Google models do not appear to have any restriction beyond the Apache 2.0 license (and ImageNet concerns). In either case, you should contact Facebook or Google with any questions.
 
+## Citing
+
+### BibTeX
+
+```
+@misc{rw2019timm,
+  author = {Ross Wightman},
+  title = {PyTorch Image Models},
+  year = {2019},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  doi = {10.5281/zenodo.4414861},
+  howpublished = {\url{https://github.com/rwightman/pytorch-image-models}}
+}
+```
+
+### Latest DOI
+
+[![DOI](https://zenodo.org/badge/168799526.svg)](https://zenodo.org/badge/latestdoi/168799526)

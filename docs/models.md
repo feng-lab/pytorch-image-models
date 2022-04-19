@@ -1,4 +1,4 @@
-# Model Architectures
+# Model Summaries
 
 The model architectures included come from a wide variety of sources. Sources, including papers, original impl ("reference code") that I rewrote / adapted, and PyTorch impl that I leveraged directly ("code") are listed below.
 
@@ -8,7 +8,9 @@ Most included models have pretrained weights. The weights are either:
 2. ported by myself from their original impl in a different framework (e.g. Tensorflow models)
 3. trained from scratch using the included training script
 
-The validation results for the pretrained weights can be found [here](results.md)
+The validation results for the pretrained weights are [here](results.md)
+
+A more exciting view (with pretty pictures) of the models within `timm` can be found at [paperswithcode](https://paperswithcode.com/lib/timm).
 
 ## Big Transfer ResNetV2 (BiT) [[resnetv2.py](https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/resnetv2.py)]
 * Paper: `Big Transfer (BiT): General Visual Representation Learning` - https://arxiv.org/abs/1912.11370

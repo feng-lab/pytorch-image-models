@@ -11,6 +11,7 @@ import argparse
 import os
 import csv
 import glob
+import json
 import time
 import logging
 import torch
@@ -21,7 +22,7 @@ from contextlib import suppress
 
 from timm.models import create_model, apply_test_time_pool, load_checkpoint, is_model, list_models
 from timm.data import create_dataset, create_loader, resolve_data_config, RealLabelsImagenet
-from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_legacy
+from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser
 
 has_apex = False
 try:
@@ -48,6 +49,8 @@ parser.add_argument('--dataset', '-d', metavar='NAME', default='',
                     help='dataset type (default: ImageFolder/ImageTar if empty)')
 parser.add_argument('--split', metavar='NAME', default='validation',
                     help='dataset split (default: validation)')
+parser.add_argument('--dataset-download', action='store_true', default=False,
+                    help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
 parser.add_argument('--model', '-m', metavar='NAME', default='dpn92',
                     help='model architecture (default: dpn92)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
@@ -80,8 +83,8 @@ parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
 parser.add_argument('--num-gpu', type=int, default=1,
                     help='Number of GPUS to use')
-parser.add_argument('--no-test-pool', dest='no_test_pool', action='store_true',
-                    help='disable test time pool')
+parser.add_argument('--test-pool', dest='test_pool', action='store_true',
+                    help='enable test time pool')
 parser.add_argument('--no-prefetcher', action='store_true', default=False,
                     help='disable fast prefetcher')
 parser.add_argument('--pin-mem', action='store_true', default=False,
@@ -100,8 +103,8 @@ parser.add_argument('--use-ema', dest='use_ema', action='store_true',
                     help='use ema version of weights if present')
 parser.add_argument('--torchscript', dest='torchscript', action='store_true',
                     help='convert model torchscript for inference')
-parser.add_argument('--legacy-jit', dest='legacy_jit', action='store_true',
-                    help='use legacy jit mode for pytorch 1.5/1.5.1/1.6 to get back fusion performance')
+parser.add_argument('--fuser', default='', type=str,
+                    help="Select jit fuser. One of ('', 'te', 'old', 'nvfuser')")
 parser.add_argument('--results-file', default='', type=str, metavar='FILENAME',
                     help='Output csv file for validation results (summary)')
 parser.add_argument('--real-labels', default='', type=str, metavar='FILENAME',
@@ -131,8 +134,8 @@ def validate(args):
     else:
         _logger.info('Validating in float32. AMP not enabled.')
 
-    if args.legacy_jit:
-        set_jit_legacy()
+    if args.fuser:
+        set_jit_fuser(args.fuser)
 
     # create model
     model = create_model(
@@ -152,9 +155,9 @@ def validate(args):
     param_count = sum([m.numel() for m in model.parameters()])
     _logger.info('Model %s created, param count: %d' % (args.model, param_count))
 
-    data_config = resolve_data_config(vars(args), model=model, use_test_size=True)
+    data_config = resolve_data_config(vars(args), model=model, use_test_size=True, verbose=True)
     test_time_pool = False
-    if not args.no_test_pool:
+    if args.test_pool:
         model, test_time_pool = apply_test_time_pool(model, data_config, use_test_size=True)
 
     if args.torchscript:
@@ -175,7 +178,7 @@ def validate(args):
 
     dataset = create_dataset(
         root=args.data, name=args.dataset, split=args.split,
-        load_bytes=args.tf_preprocessing, class_map=args.class_map)
+        download=args.dataset_download, load_bytes=args.tf_preprocessing, class_map=args.class_map)
 
     if args.valid_labels:
         with open(args.valid_labels, 'r') as f:
@@ -211,10 +214,12 @@ def validate(args):
     model.eval()
     with torch.no_grad():
         # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
-        input = torch.randn((args.batch_size,) + data_config['input_size']).cuda()
+        input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).cuda()
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
-        model(input)
+        with amp_autocast():
+            model(input)
+
         end = time.time()
         for batch_idx, (input, target) in enumerate(loader):
             if args.no_prefetcher:
@@ -261,6 +266,7 @@ def validate(args):
     else:
         top1a, top5a = top1.avg, top5.avg
     results = OrderedDict(
+        model=args.model,
         top1=round(top1a, 4), top1_err=round(100 - top1a, 4),
         top5=round(top5a, 4), top5_err=round(100 - top5a, 4),
         param_count=round(param_count / 1e6, 2),
@@ -271,6 +277,27 @@ def validate(args):
     _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
        results['top1'], results['top1_err'], results['top5'], results['top5_err']))
 
+    return results
+
+
+def _try_run(args, initial_batch_size):
+    batch_size = initial_batch_size
+    results = OrderedDict()
+    error_str = 'Unknown'
+    while batch_size >= 1:
+        args.batch_size = batch_size
+        torch.cuda.empty_cache()
+        try:
+            results = validate(args)
+            return results
+        except RuntimeError as e:
+            error_str = str(e)
+            if 'channels_last' in error_str:
+                break
+            _logger.warning(f'"{error_str}" while running validation. Reducing batch size to {batch_size} for retry.')
+        batch_size = batch_size // 2
+    results['error'] = error_str
+    _logger.error(f'{args.model} failed to validate ({error_str}).')
     return results
 
 
@@ -289,48 +316,42 @@ def main():
         if args.model == 'all':
             # validate all models in a list of names with pretrained checkpoints
             args.pretrained = True
-            model_names = list_models(pretrained=True, exclude_filters=['*in21k'])
+            model_names = list_models(pretrained=True, exclude_filters=['*_in21k', '*_in22k', '*_dino'])
             model_cfgs = [(n, '') for n in model_names]
         elif not is_model(args.model):
             # model name doesn't exist, try as wildcard filter
             model_names = list_models(args.model)
             model_cfgs = [(n, '') for n in model_names]
 
+        if not model_cfgs and os.path.isfile(args.model):
+            with open(args.model) as f:
+                model_names = [line.rstrip() for line in f]
+            model_cfgs = [(n, None) for n in model_names if n]
+
     if len(model_cfgs):
         results_file = args.results_file or './results-all.csv'
         _logger.info('Running bulk validation on these pretrained models: {}'.format(', '.join(model_names)))
         results = []
         try:
-            start_batch_size = args.batch_size
+            initial_batch_size = args.batch_size
             for m, c in model_cfgs:
-                batch_size = start_batch_size
                 args.model = m
                 args.checkpoint = c
-                result = OrderedDict(model=args.model)
-                r = {}
-                while not r and batch_size >= args.num_gpu:
-                    torch.cuda.empty_cache()
-                    try:
-                        args.batch_size = batch_size
-                        print('Validating with batch size: %d' % args.batch_size)
-                        r = validate(args)
-                    except RuntimeError as e:
-                        if batch_size <= args.num_gpu:
-                            print("Validation failed with no ability to reduce batch size. Exiting.")
-                            raise e
-                        batch_size = max(batch_size // 2, args.num_gpu)
-                        print("Validation failed, reducing batch size by 50%")
-                result.update(r)
+                r = _try_run(args, initial_batch_size)
+                if 'error' in r:
+                    continue
                 if args.checkpoint:
-                    result['checkpoint'] = args.checkpoint
-                results.append(result)
+                    r['checkpoint'] = args.checkpoint
+                results.append(r)
         except KeyboardInterrupt as e:
             pass
         results = sorted(results, key=lambda x: x['top1'], reverse=True)
         if len(results):
             write_results(results_file, results)
     else:
-        validate(args)
+        results = validate(args)
+    # output results in JSON to stdout w/ delimiter for runner script
+    print(f'--result\n{json.dumps(results, indent=4)}')
 
 
 def write_results(results_file, results):

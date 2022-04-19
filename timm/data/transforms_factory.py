@@ -1,7 +1,7 @@
 """ Transforms Factory
 Factory methods for building image transforms for use with TIMM (PyTorch Image Models)
 
-Hacked together by / Copyright 2020 Ross Wightman
+Hacked together by / Copyright 2019, Ross Wightman
 """
 import math
 
@@ -10,7 +10,7 @@ from torchvision import transforms
 
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, DEFAULT_CROP_PCT
 from timm.data.auto_augment import rand_augment_transform, augment_and_mix_transform, auto_augment_transform
-from timm.data.transforms import _pil_interp, RandomResizedCropAndInterpolation, ToNumpy, ToTensor
+from timm.data.transforms import str_to_interp_mode, str_to_pil_interp, RandomResizedCropAndInterpolation, ToNumpy
 from timm.data.random_erasing import RandomErasing
 
 
@@ -25,7 +25,7 @@ def transforms_noaug_train(
         # random interpolation not supported with no-aug
         interpolation = 'bilinear'
     tfl = [
-        transforms.Resize(img_size, _pil_interp(interpolation)),
+        transforms.Resize(img_size, interpolation=str_to_interp_mode(interpolation)),
         transforms.CenterCrop(img_size)
     ]
     if use_prefetcher:
@@ -78,7 +78,7 @@ def transforms_imagenet_train(
     secondary_tfl = []
     if auto_augment:
         assert isinstance(auto_augment, str)
-        if isinstance(img_size, tuple):
+        if isinstance(img_size, (tuple, list)):
             img_size_min = min(img_size)
         else:
             img_size_min = img_size
@@ -87,7 +87,7 @@ def transforms_imagenet_train(
             img_mean=tuple([min(255, round(255 * x)) for x in mean]),
         )
         if interpolation and interpolation != 'random':
-            aa_params['interpolation'] = _pil_interp(interpolation)
+            aa_params['interpolation'] = str_to_pil_interp(interpolation)
         if auto_augment.startswith('rand'):
             secondary_tfl += [rand_augment_transform(auto_augment, aa_params)]
         elif auto_augment.startswith('augmix'):
@@ -136,7 +136,7 @@ def transforms_imagenet_eval(
         std=IMAGENET_DEFAULT_STD):
     crop_pct = crop_pct or DEFAULT_CROP_PCT
 
-    if isinstance(img_size, tuple):
+    if isinstance(img_size, (tuple, list)):
         assert len(img_size) == 2
         if img_size[-1] == img_size[-2]:
             # fall-back to older behaviour so Resize scales to shortest edge if target is square
@@ -147,7 +147,7 @@ def transforms_imagenet_eval(
         scale_size = int(math.floor(img_size / crop_pct))
 
     tfl = [
-        transforms.Resize(scale_size, _pil_interp(interpolation)),
+        transforms.Resize(scale_size, interpolation=str_to_interp_mode(interpolation)),
         transforms.CenterCrop(img_size),
     ]
     if use_prefetcher:
@@ -186,7 +186,7 @@ def create_transform(
         tf_preprocessing=False,
         separate=False):
 
-    if isinstance(input_size, tuple):
+    if isinstance(input_size, (tuple, list)):
         img_size = input_size[-2:]
     else:
         img_size = input_size

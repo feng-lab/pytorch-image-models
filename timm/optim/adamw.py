@@ -1,5 +1,8 @@
 """ AdamW Optimizer
 Impl copied from PyTorch master
+
+NOTE: Builtin optim.AdamW is used by the factory, this impl only serves as a Python based reference, will be removed
+someday
 """
 import math
 import torch
@@ -52,6 +55,7 @@ class AdamW(Optimizer):
         for group in self.param_groups:
             group.setdefault('amsgrad', False)
 
+    @torch.no_grad()
     def step(self, closure=None):
         """Performs a single optimization step.
 
@@ -61,7 +65,8 @@ class AdamW(Optimizer):
         """
         loss = None
         if closure is not None:
-            loss = closure()
+            with torch.enable_grad():
+                loss = closure()
 
         for group in self.param_groups:
             for p in group['params']:
@@ -72,7 +77,7 @@ class AdamW(Optimizer):
                 p.data.mul_(1 - group['lr'] * group['weight_decay'])
 
                 # Perform optimization step
-                grad = p.grad.data
+                grad = p.grad
                 if grad.is_sparse:
                     raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
                 amsgrad = group['amsgrad']
@@ -83,12 +88,12 @@ class AdamW(Optimizer):
                 if len(state) == 0:
                     state['step'] = 0
                     # Exponential moving average of gradient values
-                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg'] = torch.zeros_like(p)
                     # Exponential moving average of squared gradient values
-                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
                     if amsgrad:
                         # Maintains max of all exp. moving avg. of sq. grad. values
-                        state['max_exp_avg_sq'] = torch.zeros_like(p.data)
+                        state['max_exp_avg_sq'] = torch.zeros_like(p)
 
                 exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
                 if amsgrad:
@@ -100,8 +105,8 @@ class AdamW(Optimizer):
                 bias_correction2 = 1 - beta2 ** state['step']
 
                 # Decay the first and second moment running average coefficient
-                exp_avg.mul_(beta1).add_(1 - beta1, grad)
-                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                 if amsgrad:
                     # Maintains the maximum of all 2nd moment running avg. till now
                     torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
@@ -112,6 +117,6 @@ class AdamW(Optimizer):
 
                 step_size = group['lr'] / bias_correction1
 
-                p.data.addcdiv_(-step_size, exp_avg, denom)
+                p.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss

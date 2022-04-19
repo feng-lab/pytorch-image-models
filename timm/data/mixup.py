@@ -8,7 +8,7 @@ CutMix: Regularization Strategy to Train Strong Classifiers with Localizable Fea
 Code Reference:
 CutMix: https://github.com/clovaai/CutMix-PyTorch
 
-Hacked together by / Copyright 2020 Ross Wightman
+Hacked together by / Copyright 2019, Ross Wightman
 """
 import numpy as np
 import torch
@@ -214,7 +214,7 @@ class Mixup:
             lam = self._mix_pair(x)
         else:
             lam = self._mix_batch(x)
-        target = mixup_target(target, self.num_classes, lam, self.label_smoothing)
+        target = mixup_target(target, self.num_classes, lam, self.label_smoothing, x.device)
         return x, target
 
 

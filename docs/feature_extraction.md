@@ -4,7 +4,7 @@ All of the models in `timm` have consistent mechanisms for obtaining various typ
 
 ## Penultimate Layer Features (Pre-Classifier Features)
 
-The features from the penultimate model layer can be obtained in severay ways without requiring model surgery (although feel free to do surgery). One must first decide if they want pooled or un-pooled features.
+The features from the penultimate model layer can be obtained in several ways without requiring model surgery (although feel free to do surgery). One must first decide if they want pooled or un-pooled features.
 
 ### Unpooled
 
@@ -145,7 +145,7 @@ torch.Size([2, 1512, 7, 7])
 
 ### Select specific feature levels or limit the stride
 
-There are to additional creation arguments impacting the output features. 
+There are two additional creation arguments impacting the output features. 
 
 * `out_indices` selects which indices to output
 * `output_stride` limits the feature output stride of the network (also works in classification mode BTW)

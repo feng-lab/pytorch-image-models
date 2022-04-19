@@ -3,22 +3,62 @@
 Assembles EfficieNet and related network feature blocks from string definitions.
 Handles stride, dilation calculations, and selects feature extraction points.
 
-Hacked together by / Copyright 2020 Ross Wightman
+Hacked together by / Copyright 2019, Ross Wightman
 """
 
 import logging
 import math
 import re
 from copy import deepcopy
+from functools import partial
 
 import torch.nn as nn
 
 from .efficientnet_blocks import *
-from .layers import CondConv2d, get_condconv_initializer
+from .layers import CondConv2d, get_condconv_initializer, get_act_layer, get_attn, make_divisible
 
-__all__ = ["EfficientNetBuilder", "decode_arch_def", "efficientnet_init_weights"]
+__all__ = ["EfficientNetBuilder", "decode_arch_def", "efficientnet_init_weights",
+           'resolve_bn_args', 'resolve_act_layer', 'round_channels', 'BN_MOMENTUM_TF_DEFAULT', 'BN_EPS_TF_DEFAULT']
 
 _logger = logging.getLogger(__name__)
+
+
+_DEBUG_BUILDER = False
+
+# Defaults used for Google/Tensorflow training of mobile networks /w RMSprop as per
+# papers and TF reference implementations. PT momentum equiv for TF decay is (1 - TF decay)
+# NOTE: momentum varies btw .99 and .9997 depending on source
+# .99 in official TF TPU impl
+# .9997 (/w .999 in search space) for paper
+BN_MOMENTUM_TF_DEFAULT = 1 - 0.99
+BN_EPS_TF_DEFAULT = 1e-3
+_BN_ARGS_TF = dict(momentum=BN_MOMENTUM_TF_DEFAULT, eps=BN_EPS_TF_DEFAULT)
+
+
+def get_bn_args_tf():
+    return _BN_ARGS_TF.copy()
+
+
+def resolve_bn_args(kwargs):
+    bn_args = {}
+    bn_momentum = kwargs.pop('bn_momentum', None)
+    if bn_momentum is not None:
+        bn_args['momentum'] = bn_momentum
+    bn_eps = kwargs.pop('bn_eps', None)
+    if bn_eps is not None:
+        bn_args['eps'] = bn_eps
+    return bn_args
+
+
+def resolve_act_layer(kwargs, default='relu'):
+    return get_act_layer(kwargs.pop('act_layer', default))
+
+
+def round_channels(channels, multiplier=1.0, divisor=8, channel_min=None, round_limit=0.9):
+    """Round number of filters based on depth multiplier."""
+    if not multiplier:
+        return channels
+    return make_divisible(channels * multiplier, divisor, channel_min, round_limit=round_limit)
 
 
 def _log_info_if(msg, condition):
@@ -63,11 +103,13 @@ def _decode_block_str(block_str):
     block_type = ops[0]  # take the block type off the front
     ops = ops[1:]
     options = {}
-    noskip = False
+    skip = None
     for op in ops:
         # string options being checked on individual basis, combine if they grow
         if op == 'noskip':
-            noskip = True
+            skip = False  # force no skip connection
+        elif op == 'skip':
+            skip = True  # force a skip connection
         elif op.startswith('n'):
             # activation fn
             key = op[0]
@@ -79,7 +121,9 @@ def _decode_block_str(block_str):
             elif v == 'hs':
                 value = get_act_layer('hard_swish')
             elif v == 'sw':
-                value = get_act_layer('swish')
+                value = get_act_layer('swish')  # aka SiLU
+            elif v == 'mi':
+                value = get_act_layer('mish')
             else:
                 continue
             options[key] = value
@@ -94,60 +138,53 @@ def _decode_block_str(block_str):
     act_layer = options['n'] if 'n' in options else None
     exp_kernel_size = _parse_ksize(options['a']) if 'a' in options else 1
     pw_kernel_size = _parse_ksize(options['p']) if 'p' in options else 1
-    fake_in_chs = int(options['fc']) if 'fc' in options else 0  # FIXME hack to deal with in_chs issue in TPU def
-
+    force_in_chs = int(options['fc']) if 'fc' in options else 0  # FIXME hack to deal with in_chs issue in TPU def
     num_repeat = int(options['r'])
+
     # each type of block has different valid arguments, fill accordingly
+    block_args = dict(
+        block_type=block_type,
+        out_chs=int(options['c']),
+        stride=int(options['s']),
+        act_layer=act_layer,
+    )
     if block_type == 'ir':
-        block_args = dict(
-            block_type=block_type,
+        block_args.update(dict(
             dw_kernel_size=_parse_ksize(options['k']),
             exp_kernel_size=exp_kernel_size,
             pw_kernel_size=pw_kernel_size,
-            out_chs=int(options['c']),
             exp_ratio=float(options['e']),
-            se_ratio=float(options['se']) if 'se' in options else None,
-            stride=int(options['s']),
-            act_layer=act_layer,
-            noskip=noskip,
-        )
+            se_ratio=float(options['se']) if 'se' in options else 0.,
+            noskip=skip is False,
+        ))
         if 'cc' in options:
             block_args['num_experts'] = int(options['cc'])
     elif block_type == 'ds' or block_type == 'dsa':
-        block_args = dict(
-            block_type=block_type,
+        block_args.update(dict(
             dw_kernel_size=_parse_ksize(options['k']),
             pw_kernel_size=pw_kernel_size,
-            out_chs=int(options['c']),
-            se_ratio=float(options['se']) if 'se' in options else None,
-            stride=int(options['s']),
-            act_layer=act_layer,
+            se_ratio=float(options['se']) if 'se' in options else 0.,
             pw_act=block_type == 'dsa',
-            noskip=block_type == 'dsa' or noskip,
-        )
+            noskip=block_type == 'dsa' or skip is False,
+        ))
     elif block_type == 'er':
-        block_args = dict(
-            block_type=block_type,
+        block_args.update(dict(
             exp_kernel_size=_parse_ksize(options['k']),
             pw_kernel_size=pw_kernel_size,
-            out_chs=int(options['c']),
             exp_ratio=float(options['e']),
-            fake_in_chs=fake_in_chs,
-            se_ratio=float(options['se']) if 'se' in options else None,
-            stride=int(options['s']),
-            act_layer=act_layer,
-            noskip=noskip,
-        )
+            force_in_chs=force_in_chs,
+            se_ratio=float(options['se']) if 'se' in options else 0.,
+            noskip=skip is False,
+        ))
     elif block_type == 'cn':
-        block_args = dict(
-            block_type=block_type,
+        block_args.update(dict(
             kernel_size=int(options['k']),
-            out_chs=int(options['c']),
-            stride=int(options['s']),
-            act_layer=act_layer,
-        )
+            skip=skip is True,
+        ))
     else:
         assert False, 'Unknown block type (%s)' % block_type
+    if 'gs' in options:
+        block_args['group_size'] = options['gs']
 
     return block_args, num_repeat
 
@@ -190,9 +227,33 @@ def _scale_stage_depth(stack_args, repeats, depth_multiplier=1.0, depth_trunc='c
     return sa_scaled
 
 
-def decode_arch_def(arch_def, depth_multiplier=1.0, depth_trunc='ceil', experts_multiplier=1, fix_first_last=False):
+def decode_arch_def(
+        arch_def,
+        depth_multiplier=1.0,
+        depth_trunc='ceil',
+        experts_multiplier=1,
+        fix_first_last=False,
+        group_size=None,
+):
+    """ Decode block architecture definition strings -> block kwargs
+
+    Args:
+        arch_def: architecture definition strings, list of list of strings
+        depth_multiplier: network depth multiplier
+        depth_trunc: networ depth truncation mode when applying multiplier
+        experts_multiplier: CondConv experts multiplier
+        fix_first_last: fix first and last block depths when multiplier is applied
+        group_size: group size override for all blocks that weren't explicitly set in arch string
+
+    Returns:
+        list of list of block kwargs
+    """
     arch_args = []
-    for stack_idx, block_strings in enumerate(arch_def):
+    if isinstance(depth_multiplier, tuple):
+        assert len(depth_multiplier) == len(arch_def)
+    else:
+        depth_multiplier = (depth_multiplier,) * len(arch_def)
+    for stack_idx, (block_strings, multiplier) in enumerate(zip(arch_def, depth_multiplier)):
         assert isinstance(block_strings, list)
         stack_args = []
         repeats = []
@@ -201,12 +262,14 @@ def decode_arch_def(arch_def, depth_multiplier=1.0, depth_trunc='ceil', experts_
             ba, rep = _decode_block_str(block_str)
             if ba.get('num_experts', 0) > 0 and experts_multiplier > 1:
                 ba['num_experts'] *= experts_multiplier
+            if group_size is not None:
+                ba.setdefault('group_size', group_size)
             stack_args.append(ba)
             repeats.append(rep)
         if fix_first_last and (stack_idx == 0 or stack_idx == len(arch_def) - 1):
             arch_args.append(_scale_stage_depth(stack_args, repeats, 1.0, depth_trunc))
         else:
-            arch_args.append(_scale_stage_depth(stack_args, repeats, depth_multiplier, depth_trunc))
+            arch_args.append(_scale_stage_depth(stack_args, repeats, multiplier, depth_trunc))
     return arch_args
 
 
@@ -219,19 +282,20 @@ class EfficientNetBuilder:
     https://github.com/facebookresearch/maskrcnn-benchmark/blob/master/maskrcnn_benchmark/modeling/backbone/fbnet_builder.py
 
     """
-    def __init__(self, channel_multiplier=1.0, channel_divisor=8, channel_min=None,
-                 output_stride=32, pad_type='', act_layer=None, se_kwargs=None,
-                 norm_layer=nn.BatchNorm2d, norm_kwargs=None, drop_path_rate=0., feature_location='',
-                 verbose=False):
-        self.channel_multiplier = channel_multiplier
-        self.channel_divisor = channel_divisor
-        self.channel_min = channel_min
+    def __init__(self, output_stride=32, pad_type='', round_chs_fn=round_channels, se_from_exp=False,
+                 act_layer=None, norm_layer=None, se_layer=None, drop_path_rate=0., feature_location=''):
         self.output_stride = output_stride
         self.pad_type = pad_type
+        self.round_chs_fn = round_chs_fn
+        self.se_from_exp = se_from_exp  # calculate se channel reduction from expanded (mid) chs
         self.act_layer = act_layer
-        self.se_kwargs = se_kwargs
         self.norm_layer = norm_layer
-        self.norm_kwargs = norm_kwargs
+        self.se_layer = get_attn(se_layer)
+        try:
+            self.se_layer(8, rd_ratio=1.0)  # test if attn layer accepts rd_ratio arg
+            self.se_has_ratio = True
+        except TypeError:
+            self.se_has_ratio = False
         self.drop_path_rate = drop_path_rate
         if feature_location == 'depthwise':
             # old 'depthwise' mode renamed 'expansion' to match TF impl, old expansion mode didn't make sense
@@ -239,45 +303,44 @@ class EfficientNetBuilder:
             feature_location = 'expansion'
         self.feature_location = feature_location
         assert feature_location in ('bottleneck', 'expansion', '')
-        self.verbose = verbose
+        self.verbose = _DEBUG_BUILDER
 
         # state updated during build, consumed by model
         self.in_chs = None
         self.features = []
 
-    def _round_channels(self, chs):
-        return round_channels(chs, self.channel_multiplier, self.channel_divisor, self.channel_min)
-
     def _make_block(self, ba, block_idx, block_count):
         drop_path_rate = self.drop_path_rate * block_idx / block_count
         bt = ba.pop('block_type')
         ba['in_chs'] = self.in_chs
-        ba['out_chs'] = self._round_channels(ba['out_chs'])
-        if 'fake_in_chs' in ba and ba['fake_in_chs']:
-            # FIXME this is a hack to work around mismatch in origin impl input filters
-            ba['fake_in_chs'] = self._round_channels(ba['fake_in_chs'])
-        ba['norm_layer'] = self.norm_layer
-        ba['norm_kwargs'] = self.norm_kwargs
+        ba['out_chs'] = self.round_chs_fn(ba['out_chs'])
+        if 'force_in_chs' in ba and ba['force_in_chs']:
+            # NOTE this is a hack to work around mismatch in TF EdgeEffNet impl
+            ba['force_in_chs'] = self.round_chs_fn(ba['force_in_chs'])
         ba['pad_type'] = self.pad_type
         # block act fn overrides the model default
         ba['act_layer'] = ba['act_layer'] if ba['act_layer'] is not None else self.act_layer
         assert ba['act_layer'] is not None
+        ba['norm_layer'] = self.norm_layer
+        ba['drop_path_rate'] = drop_path_rate
+        if bt != 'cn':
+            se_ratio = ba.pop('se_ratio')
+            if se_ratio and self.se_layer is not None:
+                if not self.se_from_exp:
+                    # adjust se_ratio by expansion ratio if calculating se channels from block input
+                    se_ratio /= ba.get('exp_ratio', 1.0)
+                if self.se_has_ratio:
+                    ba['se_layer'] = partial(self.se_layer, rd_ratio=se_ratio)
+                else:
+                    ba['se_layer'] = self.se_layer
+
         if bt == 'ir':
-            ba['drop_path_rate'] = drop_path_rate
-            ba['se_kwargs'] = self.se_kwargs
             _log_info_if('  InvertedResidual {}, Args: {}'.format(block_idx, str(ba)), self.verbose)
-            if ba.get('num_experts', 0) > 0:
-                block = CondConvResidual(**ba)
-            else:
-                block = InvertedResidual(**ba)
+            block = CondConvResidual(**ba) if ba.get('num_experts', 0) else InvertedResidual(**ba)
         elif bt == 'ds' or bt == 'dsa':
-            ba['drop_path_rate'] = drop_path_rate
-            ba['se_kwargs'] = self.se_kwargs
             _log_info_if('  DepthwiseSeparable {}, Args: {}'.format(block_idx, str(ba)), self.verbose)
             block = DepthwiseSeparableConv(**ba)
         elif bt == 'er':
-            ba['drop_path_rate'] = drop_path_rate
-            ba['se_kwargs'] = self.se_kwargs
             _log_info_if('  EdgeResidual {}, Args: {}'.format(block_idx, str(ba)), self.verbose)
             block = EdgeResidual(**ba)
         elif bt == 'cn':
@@ -285,8 +348,8 @@ class EfficientNetBuilder:
             block = ConvBnAct(**ba)
         else:
             assert False, 'Uknkown block type (%s) while building model.' % bt
-        self.in_chs = ba['out_chs']  # update in_chs for arg of next block
 
+        self.in_chs = ba['out_chs']  # update in_chs for arg of next block
         return block
 
     def __call__(self, in_chs, model_block_args):
@@ -383,28 +446,28 @@ def _init_weight_goog(m, n='', fix_group_fanout=True):
         if fix_group_fanout:
             fan_out //= m.groups
         init_weight_fn = get_condconv_initializer(
-            lambda w: w.data.normal_(0, math.sqrt(2.0 / fan_out)), m.num_experts, m.weight_shape)
+            lambda w: nn.init.normal_(w, 0, math.sqrt(2.0 / fan_out)), m.num_experts, m.weight_shape)
         init_weight_fn(m.weight)
         if m.bias is not None:
-            m.bias.data.zero_()
+            nn.init.zeros_(m.bias)
     elif isinstance(m, nn.Conv2d):
         fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
         if fix_group_fanout:
             fan_out //= m.groups
-        m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+        nn.init.normal_(m.weight, 0, math.sqrt(2.0 / fan_out))
         if m.bias is not None:
-            m.bias.data.zero_()
+            nn.init.zeros_(m.bias)
     elif isinstance(m, nn.BatchNorm2d):
-        m.weight.data.fill_(1.0)
-        m.bias.data.zero_()
+        nn.init.ones_(m.weight)
+        nn.init.zeros_(m.bias)
     elif isinstance(m, nn.Linear):
         fan_out = m.weight.size(0)  # fan-out
         fan_in = 0
         if 'routing_fn' in n:
             fan_in = m.weight.size(1)
         init_range = 1.0 / math.sqrt(fan_in + fan_out)
-        m.weight.data.uniform_(-init_range, init_range)
-        m.bias.data.zero_()
+        nn.init.uniform_(m.weight, -init_range, init_range)
+        nn.init.zeros_(m.bias)
 
 
 def efficientnet_init_weights(model: nn.Module, init_fn=None):

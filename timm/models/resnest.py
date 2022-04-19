@@ -11,7 +11,7 @@ from torch import nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from .helpers import build_model_with_cfg
-from .layers import SplitAttnConv2d
+from .layers import SplitAttn
 from .registry import register_model
 from .resnet import ResNet
 
@@ -57,10 +57,11 @@ class ResNestBottleneck(nn.Module):
     # pylint: disable=unused-argument
     expansion = 4
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None,
-                 radix=1, cardinality=1, base_width=64, avd=False, avd_first=False, is_first=False,
-                 reduce_first=1, dilation=1, first_dilation=None, act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d,
-                 attn_layer=None, aa_layer=None, drop_block=None, drop_path=None):
+    def __init__(
+            self, inplanes, planes, stride=1, downsample=None,
+            radix=1, cardinality=1, base_width=64, avd=False, avd_first=False, is_first=False,
+            reduce_first=1, dilation=1, first_dilation=None, act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d,
+            attn_layer=None, aa_layer=None, drop_block=None, drop_path=None):
         super(ResNestBottleneck, self).__init__()
         assert reduce_first == 1  # not supported
         assert attn_layer is None  # not supported
@@ -75,7 +76,6 @@ class ResNestBottleneck(nn.Module):
         else:
             avd_stride = 0
         self.radix = radix
-        self.drop_block = drop_block
 
         self.conv1 = nn.Conv2d(inplanes, group_width, kernel_size=1, bias=False)
         self.bn1 = norm_layer(group_width)
@@ -83,16 +83,18 @@ class ResNestBottleneck(nn.Module):
         self.avd_first = nn.AvgPool2d(3, avd_stride, padding=1) if avd_stride > 0 and avd_first else None
 
         if self.radix >= 1:
-            self.conv2 = SplitAttnConv2d(
+            self.conv2 = SplitAttn(
                 group_width, group_width, kernel_size=3, stride=stride, padding=first_dilation,
-                dilation=first_dilation, groups=cardinality, radix=radix, norm_layer=norm_layer, drop_block=drop_block)
-            self.bn2 = None  # FIXME revisit, here to satisfy current torchscript fussyness
-            self.act2 = None
+                dilation=first_dilation, groups=cardinality, radix=radix, norm_layer=norm_layer, drop_layer=drop_block)
+            self.bn2 = nn.Identity()
+            self.drop_block = nn.Identity()
+            self.act2 = nn.Identity()
         else:
             self.conv2 = nn.Conv2d(
                 group_width, group_width, kernel_size=3, stride=stride, padding=first_dilation,
                 dilation=first_dilation, groups=cardinality, bias=False)
             self.bn2 = norm_layer(group_width)
+            self.drop_block = drop_block() if drop_block is not None else nn.Identity()
             self.act2 = act_layer(inplace=True)
         self.avd_last = nn.AvgPool2d(3, avd_stride, padding=1) if avd_stride > 0 and not avd_first else None
 
@@ -101,47 +103,40 @@ class ResNestBottleneck(nn.Module):
         self.act3 = act_layer(inplace=True)
         self.downsample = downsample
 
-    def zero_init_last_bn(self):
+    def zero_init_last(self):
         nn.init.zeros_(self.bn3.weight)
 
     def forward(self, x):
-        residual = x
+        shortcut = x
 
         out = self.conv1(x)
         out = self.bn1(out)
-        if self.drop_block is not None:
-            out = self.drop_block(out)
         out = self.act1(out)
 
         if self.avd_first is not None:
             out = self.avd_first(out)
 
         out = self.conv2(out)
-        if self.bn2 is not None:
-            out = self.bn2(out)
-            if self.drop_block is not None:
-                out = self.drop_block(out)
-            out = self.act2(out)
+        out = self.bn2(out)
+        out = self.drop_block(out)
+        out = self.act2(out)
 
         if self.avd_last is not None:
             out = self.avd_last(out)
 
         out = self.conv3(out)
         out = self.bn3(out)
-        if self.drop_block is not None:
-            out = self.drop_block(out)
 
         if self.downsample is not None:
-            residual = self.downsample(x)
+            shortcut = self.downsample(x)
 
-        out += residual
+        out += shortcut
         out = self.act3(out)
         return out
 
 
 def _create_resnest(variant, pretrained=False, **kwargs):
-    return build_model_with_cfg(
-        ResNet, variant, default_cfg=default_cfgs[variant], pretrained=pretrained, **kwargs)
+    return build_model_with_cfg(ResNet, variant, pretrained, **kwargs)
 
 
 @register_model

@@ -34,15 +34,13 @@ class Adafactor(torch.optim.Optimizer):
         beta1 (float): coefficient used for computing running averages of gradient (default: None)
         weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
         scale_parameter (bool): if True, learning rate is scaled by root mean square of parameter (default: True)
-        relative_step (bool): if True, time-dependent learning rate is computed
-            instead of external learning rate (default: True)
         warmup_init (bool): time-dependent learning rate computation depends on
             whether warm-up initialization is being used (default: False)
     """
 
     def __init__(self, params, lr=None, eps=1e-30, eps_scale=1e-3, clip_threshold=1.0,
                  decay_rate=-0.8, betas=None, weight_decay=0.0, scale_parameter=True, warmup_init=False):
-        relative_step = lr is None
+        relative_step = not lr
         if warmup_init and not relative_step:
             raise ValueError('warmup_init requires relative_step=True')
 
@@ -78,6 +76,7 @@ class Adafactor(torch.optim.Optimizer):
         c_factor = exp_avg_sq_col.unsqueeze(-2).rsqrt()
         return torch.mul(r_factor, c_factor)
 
+    @torch.no_grad()
     def step(self, closure=None):
         """Performs a single optimization step.
         Arguments:
@@ -85,22 +84,22 @@ class Adafactor(torch.optim.Optimizer):
         """
         loss = None
         if closure is not None:
-            loss = closure()
+            with torch.enable_grad():
+                loss = closure()
 
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
                     continue
-                grad = p.grad.data
+                grad = p.grad
                 if grad.dtype in {torch.float16, torch.bfloat16}:
                     grad = grad.float()
                 if grad.is_sparse:
                     raise RuntimeError('Adafactor does not support sparse gradients.')
 
                 state = self.state[p]
-                grad_shape = grad.shape
 
-                factored, use_first_moment = self._get_options(group, grad_shape)
+                factored, use_first_moment = self._get_options(group, grad.shape)
                 # State Initialization
                 if len(state) == 0:
                     state['step'] = 0
@@ -109,8 +108,8 @@ class Adafactor(torch.optim.Optimizer):
                         # Exponential moving average of gradient values
                         state['exp_avg'] = torch.zeros_like(grad)
                     if factored:
-                        state['exp_avg_sq_row'] = torch.zeros(grad_shape[:-1]).to(grad)
-                        state['exp_avg_sq_col'] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).to(grad)
+                        state['exp_avg_sq_row'] = torch.zeros(grad.shape[:-1]).to(grad)
+                        state['exp_avg_sq_col'] = torch.zeros(grad.shape[:-2] + grad.shape[-1:]).to(grad)
                     else:
                         state['exp_avg_sq'] = torch.zeros_like(grad)
 
@@ -124,12 +123,12 @@ class Adafactor(torch.optim.Optimizer):
                     else:
                         state['exp_avg_sq'] = state['exp_avg_sq'].to(grad)
 
-                p_data_fp32 = p.data
-                if p.data.dtype in {torch.float16, torch.bfloat16}:
-                    p_data_fp32 = p_data_fp32.float()
+                p_fp32 = p
+                if p.dtype in {torch.float16, torch.bfloat16}:
+                    p_fp32 = p_fp32.float()
 
                 state['step'] += 1
-                state['RMS'] = self._rms(p_data_fp32)
+                state['RMS'] = self._rms(p_fp32)
                 lr_t = self._get_lr(group, state)
 
                 beta2t = 1.0 - math.pow(state['step'], group['decay_rate'])
@@ -138,10 +137,8 @@ class Adafactor(torch.optim.Optimizer):
                     exp_avg_sq_row = state['exp_avg_sq_row']
                     exp_avg_sq_col = state['exp_avg_sq_col']
 
-                    exp_avg_sq_row.mul_(beta2t).add_(1.0 - beta2t, update.mean(dim=-1))
-                    exp_avg_sq_col.mul_(beta2t).add_(1.0 - beta2t, update.mean(dim=-2))
-                    #exp_avg_sq_row.mul_(beta2t).add_(update.mean(dim=-1), alpha=1.0 - beta2t)  # pytorch 1.6+
-                    #exp_avg_sq_col.mul_(beta2t).add_(update.mean(dim=-2), alpha=1.0 - beta2t)
+                    exp_avg_sq_row.mul_(beta2t).add_(update.mean(dim=-1), alpha=1.0 - beta2t)
+                    exp_avg_sq_col.mul_(beta2t).add_(update.mean(dim=-2), alpha=1.0 - beta2t)
 
                     # Approximation of exponential moving average of square of gradient
                     update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
@@ -149,8 +146,7 @@ class Adafactor(torch.optim.Optimizer):
                 else:
                     exp_avg_sq = state['exp_avg_sq']
 
-                    exp_avg_sq.mul_(beta2t).add_(1.0 - beta2t, update)
-                    #exp_avg_sq.mul_(beta2t).add_(update, alpha=1.0 - beta2t)  # pytorch 1.6+
+                    exp_avg_sq.mul_(beta2t).add_(update, alpha=1.0 - beta2t)
                     update = exp_avg_sq.rsqrt().mul_(grad)
 
                 update.div_((self._rms(update) / group['clip_threshold']).clamp_(min=1.0))
@@ -158,17 +154,14 @@ class Adafactor(torch.optim.Optimizer):
 
                 if use_first_moment:
                     exp_avg = state['exp_avg']
-                    exp_avg.mul_(group["beta1"]).add_(1 - group["beta1"], update)
-                    #exp_avg.mul_(group['beta1']).add_(update, alpha=1 - group['beta1'])  # pytorch 1.6+
+                    exp_avg.mul_(group['beta1']).add_(update, alpha=1 - group['beta1'])
                     update = exp_avg
 
                 if group['weight_decay'] != 0:
-                    p_data_fp32.add_(-group["weight_decay"] * lr_t, p_data_fp32)
-                    #p_data_fp32.add_(p_data_fp32, alpha=-group['weight_decay'] * lr_t)  # pytorch 1.6+
+                    p_fp32.add_(p_fp32, alpha=-group['weight_decay'] * lr_t)
 
-                p_data_fp32.add_(-update)
-
-                if p.data.dtype in {torch.float16, torch.bfloat16}:
-                    p.data.copy_(p_data_fp32)
+                p_fp32.add_(-update)
+                if p.dtype in {torch.float16, torch.bfloat16}:
+                    p.copy_(p_fp32)
 
         return loss

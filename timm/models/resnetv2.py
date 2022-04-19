@@ -11,6 +11,7 @@ https://github.com/google-research/vision_transformer
 Thanks to the Google team for the above two repositories and associated papers:
 * Big Transfer (BiT): General Visual Representation Learning - https://arxiv.org/abs/1912.11370
 * An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale - https://arxiv.org/abs/2010.11929
+* Knowledge distillation: A good teacher is patient and consistent - https://arxiv.org/abs/2106.05237
 
 Original copyright of Google code below, modifications by Ross Wightman, Copyright 2020.
 """
@@ -35,16 +36,17 @@ import torch.nn as nn
 from functools import partial
 
 from timm.data import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
-from .helpers import build_model_with_cfg
+from .helpers import build_model_with_cfg, named_apply, adapt_input_conv, checkpoint_seq
 from .registry import register_model
-from .layers import GroupNormAct, ClassifierHead, DropPath, AvgPool2dSame, create_pool2d, StdConv2d
+from .layers import GroupNormAct, BatchNormAct2d, EvoNorm2dB0, EvoNorm2dS0, EvoNorm2dS1, FilterResponseNormTlu2d,\
+    ClassifierHead, DropPath, AvgPool2dSame, create_pool2d, StdConv2d, create_conv2d
 
 
 def _cfg(url='', **kwargs):
     return {
         'url': url,
-        'num_classes': 1000, 'input_size': (3, 480, 480), 'pool_size': (7, 7),
-        'crop_pct': 1.0, 'interpolation': 'bilinear',
+        'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
+        'crop_pct': 0.875, 'interpolation': 'bilinear',
         'mean': IMAGENET_INCEPTION_MEAN, 'std': IMAGENET_INCEPTION_STD,
         'first_conv': 'stem.conv', 'classifier': 'head.fc',
         **kwargs
@@ -54,17 +56,23 @@ def _cfg(url='', **kwargs):
 default_cfgs = {
     # pretrained on imagenet21k, finetuned on imagenet1k
     'resnetv2_50x1_bitm': _cfg(
-        url='https://storage.googleapis.com/bit_models/BiT-M-R50x1-ILSVRC2012.npz'),
+        url='https://storage.googleapis.com/bit_models/BiT-M-R50x1-ILSVRC2012.npz',
+        input_size=(3, 448, 448), pool_size=(14, 14), crop_pct=1.0),
     'resnetv2_50x3_bitm': _cfg(
-        url='https://storage.googleapis.com/bit_models/BiT-M-R50x3-ILSVRC2012.npz'),
+        url='https://storage.googleapis.com/bit_models/BiT-M-R50x3-ILSVRC2012.npz',
+        input_size=(3, 448, 448), pool_size=(14, 14), crop_pct=1.0),
     'resnetv2_101x1_bitm': _cfg(
-        url='https://storage.googleapis.com/bit_models/BiT-M-R101x1-ILSVRC2012.npz'),
+        url='https://storage.googleapis.com/bit_models/BiT-M-R101x1-ILSVRC2012.npz',
+        input_size=(3, 448, 448), pool_size=(14, 14), crop_pct=1.0),
     'resnetv2_101x3_bitm': _cfg(
-        url='https://storage.googleapis.com/bit_models/BiT-M-R101x3-ILSVRC2012.npz'),
+        url='https://storage.googleapis.com/bit_models/BiT-M-R101x3-ILSVRC2012.npz',
+        input_size=(3, 448, 448), pool_size=(14, 14), crop_pct=1.0),
     'resnetv2_152x2_bitm': _cfg(
-        url='https://storage.googleapis.com/bit_models/BiT-M-R152x2-ILSVRC2012.npz'),
+        url='https://storage.googleapis.com/bit_models/BiT-M-R152x2-ILSVRC2012.npz',
+        input_size=(3, 448, 448), pool_size=(14, 14), crop_pct=1.0),
     'resnetv2_152x4_bitm': _cfg(
-        url='https://storage.googleapis.com/bit_models/BiT-M-R152x4-ILSVRC2012.npz'),
+        url='https://storage.googleapis.com/bit_models/BiT-M-R152x4-ILSVRC2012.npz',
+        input_size=(3, 480, 480), pool_size=(15, 15), crop_pct=1.0),  # only one at 480x480?
 
     # trained on imagenet-21k
     'resnetv2_50x1_bitm_in21k': _cfg(
@@ -86,20 +94,43 @@ default_cfgs = {
         url='https://storage.googleapis.com/bit_models/BiT-M-R152x4.npz',
         num_classes=21843),
 
+    'resnetv2_50x1_bit_distilled': _cfg(
+        url='https://storage.googleapis.com/bit_models/distill/R50x1_224.npz',
+        interpolation='bicubic'),
+    'resnetv2_152x2_bit_teacher': _cfg(
+        url='https://storage.googleapis.com/bit_models/distill/R152x2_T_224.npz',
+        interpolation='bicubic'),
+    'resnetv2_152x2_bit_teacher_384': _cfg(
+        url='https://storage.googleapis.com/bit_models/distill/R152x2_T_384.npz',
+        input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, interpolation='bicubic'),
 
-    # trained on imagenet-1k, NOTE not overly interesting set of weights, leaving disabled for now
-    # 'resnetv2_50x1_bits': _cfg(
-    #     url='https://storage.googleapis.com/bit_models/BiT-S-R50x1.npz'),
-    # 'resnetv2_50x3_bits': _cfg(
-    #     url='https://storage.googleapis.com/bit_models/BiT-S-R50x3.npz'),
-    # 'resnetv2_101x1_bits': _cfg(
-    #     url='https://storage.googleapis.com/bit_models/BiT-S-R101x3.npz'),
-    # 'resnetv2_101x3_bits': _cfg(
-    #     url='https://storage.googleapis.com/bit_models/BiT-S-R101x3.npz'),
-    # 'resnetv2_152x2_bits': _cfg(
-    #     url='https://storage.googleapis.com/bit_models/BiT-S-R152x2.npz'),
-    # 'resnetv2_152x4_bits': _cfg(
-    #     url='https://storage.googleapis.com/bit_models/BiT-S-R152x4.npz'),
+    'resnetv2_50': _cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/resnetv2_50_a1h-000cdf49.pth',
+        interpolation='bicubic', crop_pct=0.95),
+    'resnetv2_50d': _cfg(
+        interpolation='bicubic', first_conv='stem.conv1'),
+    'resnetv2_50t': _cfg(
+        interpolation='bicubic', first_conv='stem.conv1'),
+    'resnetv2_101': _cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/resnetv2_101_a1h-5d01f016.pth',
+        interpolation='bicubic', crop_pct=0.95),
+    'resnetv2_101d': _cfg(
+        interpolation='bicubic', first_conv='stem.conv1'),
+    'resnetv2_152': _cfg(
+        interpolation='bicubic'),
+    'resnetv2_152d': _cfg(
+        interpolation='bicubic', first_conv='stem.conv1'),
+
+    'resnetv2_50d_gn': _cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tpu-weights/resnetv2_50d_gn_ah-c415c11a.pth',
+        interpolation='bicubic', first_conv='stem.conv1', test_input_size=(3, 288, 288), crop_pct=0.95),
+    'resnetv2_50d_evob': _cfg(
+        interpolation='bicubic', first_conv='stem.conv1'),
+    'resnetv2_50d_evos': _cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tpu-weights/resnetv2_50d_evos_ah-7c4dd548.pth',
+        interpolation='bicubic', first_conv='stem.conv1', test_input_size=(3, 288, 288), crop_pct=0.95),
+    'resnetv2_50d_frn': _cfg(
+        interpolation='bicubic', first_conv='stem.conv1'),
 }
 
 
@@ -109,13 +140,6 @@ def make_div(v, divisor=8):
     if new_v < 0.9 * v:
         new_v += divisor
     return new_v
-
-
-def tf2th(conv_weights):
-    """Possibly convert HWIO to OIHW."""
-    if conv_weights.ndim == 4:
-        conv_weights = conv_weights.transpose([3, 2, 0, 1])
-    return torch.from_numpy(conv_weights)
 
 
 class PreActBottleneck(nn.Module):
@@ -151,6 +175,9 @@ class PreActBottleneck(nn.Module):
         self.norm3 = norm_layer(mid_chs)
         self.conv3 = conv_layer(mid_chs, out_chs, 1)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
+
+    def zero_init_last(self):
+        nn.init.zeros_(self.conv3.weight)
 
     def forward(self, x):
         x_preact = self.norm1(x)
@@ -197,6 +224,9 @@ class Bottleneck(nn.Module):
         self.norm3 = norm_layer(out_chs, apply_act=False)
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
         self.act3 = act_layer(inplace=True)
+
+    def zero_init_last(self):
+        nn.init.zeros_(self.norm3.weight)
 
     def forward(self, x):
         # shortcut branch
@@ -249,9 +279,10 @@ class DownsampleAvg(nn.Module):
 
 class ResNetStage(nn.Module):
     """ResNet Stage."""
-    def __init__(self, in_chs, out_chs, stride, dilation, depth, bottle_ratio=0.25, groups=1,
-                 avg_down=False, block_dpr=None, block_fn=PreActBottleneck,
-                 act_layer=None, conv_layer=None, norm_layer=None, **block_kwargs):
+    def __init__(
+            self, in_chs, out_chs, stride, dilation, depth, bottle_ratio=0.25, groups=1,
+            avg_down=False, block_dpr=None, block_fn=PreActBottleneck,
+            act_layer=None, conv_layer=None, norm_layer=None, **block_kwargs):
         super(ResNetStage, self).__init__()
         first_dilation = 1 if dilation in (1, 2) else 2
         layer_kwargs = dict(act_layer=act_layer, conv_layer=conv_layer, norm_layer=norm_layer)
@@ -274,23 +305,35 @@ class ResNetStage(nn.Module):
         return x
 
 
-def create_stem(in_chs, out_chs, stem_type='', preact=True, conv_layer=None, norm_layer=None):
+def is_stem_deep(stem_type):
+    return any([s in stem_type for s in ('deep', 'tiered')])
+
+
+def create_resnetv2_stem(
+        in_chs, out_chs=64, stem_type='', preact=True,
+        conv_layer=StdConv2d, norm_layer=partial(GroupNormAct, num_groups=32)):
     stem = OrderedDict()
-    assert stem_type in ('', 'fixed', 'same', 'deep', 'deep_fixed', 'deep_same')
+    assert stem_type in ('', 'fixed', 'same', 'deep', 'deep_fixed', 'deep_same', 'tiered')
 
     # NOTE conv padding mode can be changed by overriding the conv_layer def
-    if 'deep' in stem_type:
+    if is_stem_deep(stem_type):
         # A 3 deep 3x3  conv stack as in ResNet V1D models
-        mid_chs = out_chs // 2
-        stem['conv1'] = conv_layer(in_chs, mid_chs, kernel_size=3, stride=2)
-        stem['conv2'] = conv_layer(mid_chs, mid_chs, kernel_size=3, stride=1)
-        stem['conv3'] = conv_layer(mid_chs, out_chs, kernel_size=3, stride=1)
+        if 'tiered' in stem_type:
+            stem_chs = (3 * out_chs // 8, out_chs // 2)  # 'T' resnets in resnet.py
+        else:
+            stem_chs = (out_chs // 2, out_chs // 2)  # 'D' ResNets
+        stem['conv1'] = conv_layer(in_chs, stem_chs[0], kernel_size=3, stride=2)
+        stem['norm1'] = norm_layer(stem_chs[0])
+        stem['conv2'] = conv_layer(stem_chs[0], stem_chs[1], kernel_size=3, stride=1)
+        stem['norm2'] = norm_layer(stem_chs[1])
+        stem['conv3'] = conv_layer(stem_chs[1], out_chs, kernel_size=3, stride=1)
+        if not preact:
+            stem['norm3'] = norm_layer(out_chs)
     else:
         # The usual 7x7 stem conv
         stem['conv'] = conv_layer(in_chs, out_chs, kernel_size=7, stride=2)
-
-    if not preact:
-        stem['norm'] = norm_layer(out_chs)
+        if not preact:
+            stem['norm'] = norm_layer(out_chs)
 
     if 'fixed' in stem_type:
         # 'fixed' SAME padding approximation that is used in BiT models
@@ -310,11 +353,12 @@ class ResNetV2(nn.Module):
     """Implementation of Pre-activation (v2) ResNet mode.
     """
 
-    def __init__(self, layers, channels=(256, 512, 1024, 2048),
-                 num_classes=1000, in_chans=3, global_pool='avg', output_stride=32,
-                 width_factor=1, stem_chs=64, stem_type='', avg_down=False, preact=True,
-                 act_layer=nn.ReLU, conv_layer=StdConv2d, norm_layer=partial(GroupNormAct, num_groups=32),
-                 drop_rate=0., drop_path_rate=0.):
+    def __init__(
+            self, layers, channels=(256, 512, 1024, 2048),
+            num_classes=1000, in_chans=3, global_pool='avg', output_stride=32,
+            width_factor=1, stem_chs=64, stem_type='', avg_down=False, preact=True,
+            act_layer=nn.ReLU, conv_layer=StdConv2d, norm_layer=partial(GroupNormAct, num_groups=32),
+            drop_rate=0., drop_path_rate=0., zero_init_last=False):
         super().__init__()
         self.num_classes = num_classes
         self.drop_rate = drop_rate
@@ -322,9 +366,10 @@ class ResNetV2(nn.Module):
 
         self.feature_info = []
         stem_chs = make_div(stem_chs * wf)
-        self.stem = create_stem(in_chans, stem_chs, stem_type, preact, conv_layer=conv_layer, norm_layer=norm_layer)
-        # NOTE no, reduction 2 feature if preact
-        self.feature_info.append(dict(num_chs=stem_chs, reduction=2, module='' if preact else 'stem.norm'))
+        self.stem = create_resnetv2_stem(
+            in_chans, stem_chs, stem_type, preact, conv_layer=conv_layer, norm_layer=norm_layer)
+        stem_feat = ('stem.conv3' if is_stem_deep(stem_type) else 'stem.conv') if preact else 'stem.norm'
+        self.feature_info.append(dict(num_chs=stem_chs, reduction=2, module=stem_feat))
 
         prev_chs = stem_chs
         curr_stride = 4
@@ -343,10 +388,7 @@ class ResNetV2(nn.Module):
                 act_layer=act_layer, conv_layer=conv_layer, norm_layer=norm_layer, block_dpr=bdpr, block_fn=block_fn)
             prev_chs = out_chs
             curr_stride *= stride
-            feat_name = f'stages.{stage_idx}'
-            if preact:
-                feat_name = f'stages.{stage_idx + 1}.blocks.0.norm1' if (stage_idx + 1) != len(channels) else 'norm'
-            self.feature_info += [dict(num_chs=prev_chs, reduction=curr_stride, module=feat_name)]
+            self.feature_info += [dict(num_chs=prev_chs, reduction=curr_stride, module=f'stages.{stage_idx}')]
             self.stages.add_module(str(stage_idx), stage)
 
         self.num_features = prev_chs
@@ -354,202 +396,313 @@ class ResNetV2(nn.Module):
         self.head = ClassifierHead(
             self.num_features, num_classes, pool_type=global_pool, drop_rate=self.drop_rate, use_conv=True)
 
-        for n, m in self.named_modules():
-            if isinstance(m, nn.Linear) or ('.fc' in n and isinstance(m, nn.Conv2d)):
-                nn.init.normal_(m.weight, mean=0.0, std=0.01)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        self.init_weights(zero_init_last=zero_init_last)
+        self.grad_checkpointing = False
 
+    @torch.jit.ignore
+    def init_weights(self, zero_init_last=True):
+        named_apply(partial(_init_weights, zero_init_last=zero_init_last), self)
+
+    @torch.jit.ignore()
+    def load_pretrained(self, checkpoint_path, prefix='resnet/'):
+        _load_weights(self, checkpoint_path, prefix)
+
+    @torch.jit.ignore
+    def group_matcher(self, coarse=False):
+        matcher = dict(
+            stem=r'^stem',
+            blocks=r'^stages\.(\d+)' if coarse else [
+                (r'^stages\.(\d+)\.blocks\.(\d+)', None),
+                (r'^norm', (99999,))
+            ]
+        )
+        return matcher
+
+    @torch.jit.ignore
+    def set_grad_checkpointing(self, enable=True):
+        self.grad_checkpointing = enable
+
+    @torch.jit.ignore
     def get_classifier(self):
         return self.head.fc
 
     def reset_classifier(self, num_classes, global_pool='avg'):
+        self.num_classes = num_classes
         self.head = ClassifierHead(
             self.num_features, num_classes, pool_type=global_pool, drop_rate=self.drop_rate, use_conv=True)
 
     def forward_features(self, x):
         x = self.stem(x)
-        x = self.stages(x)
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            x = checkpoint_seq(self.stages, x, flatten=True)
+        else:
+            x = self.stages(x)
         x = self.norm(x)
         return x
 
+    def forward_head(self, x, pre_logits: bool = False):
+        return self.head(x, pre_logits=pre_logits)
+
     def forward(self, x):
         x = self.forward_features(x)
-        x = self.head(x)
-        if not self.head.global_pool.is_identity():
-            x = x.flatten(1)  # conv classifier, flatten if pooling isn't pass-through (disabled)
+        x = self.forward_head(x)
         return x
 
-    def load_pretrained(self, checkpoint_path, prefix='resnet/'):
-        import numpy as np
-        weights = np.load(checkpoint_path)
-        with torch.no_grad():
-            stem_conv_w = tf2th(weights[f'{prefix}root_block/standardized_conv2d/kernel'])
-            if self.stem.conv.weight.shape[1] == 1:
-                self.stem.conv.weight.copy_(stem_conv_w.sum(dim=1, keepdim=True))
-                # FIXME handle > 3 in_chans?
-            else:
-                self.stem.conv.weight.copy_(stem_conv_w)
-            self.norm.weight.copy_(tf2th(weights[f'{prefix}group_norm/gamma']))
-            self.norm.bias.copy_(tf2th(weights[f'{prefix}group_norm/beta']))
-            self.head.fc.weight.copy_(tf2th(weights[f'{prefix}head/conv2d/kernel']))
-            self.head.fc.bias.copy_(tf2th(weights[f'{prefix}head/conv2d/bias']))
-            for i, (sname, stage) in enumerate(self.stages.named_children()):
-                for j, (bname, block) in enumerate(stage.blocks.named_children()):
-                    convname = 'standardized_conv2d'
-                    block_prefix = f'{prefix}block{i + 1}/unit{j + 1:02d}/'
-                    block.conv1.weight.copy_(tf2th(weights[f'{block_prefix}a/{convname}/kernel']))
-                    block.conv2.weight.copy_(tf2th(weights[f'{block_prefix}b/{convname}/kernel']))
-                    block.conv3.weight.copy_(tf2th(weights[f'{block_prefix}c/{convname}/kernel']))
-                    block.norm1.weight.copy_(tf2th(weights[f'{block_prefix}a/group_norm/gamma']))
-                    block.norm2.weight.copy_(tf2th(weights[f'{block_prefix}b/group_norm/gamma']))
-                    block.norm3.weight.copy_(tf2th(weights[f'{block_prefix}c/group_norm/gamma']))
-                    block.norm1.bias.copy_(tf2th(weights[f'{block_prefix}a/group_norm/beta']))
-                    block.norm2.bias.copy_(tf2th(weights[f'{block_prefix}b/group_norm/beta']))
-                    block.norm3.bias.copy_(tf2th(weights[f'{block_prefix}c/group_norm/beta']))
-                    if block.downsample is not None:
-                        w = weights[f'{block_prefix}a/proj/{convname}/kernel']
-                        block.downsample.conv.weight.copy_(tf2th(w))
+
+def _init_weights(module: nn.Module, name: str = '', zero_init_last=True):
+    if isinstance(module, nn.Linear) or ('head.fc' in name and isinstance(module, nn.Conv2d)):
+        nn.init.normal_(module.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Conv2d):
+        nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, (nn.BatchNorm2d, nn.LayerNorm, nn.GroupNorm)):
+        nn.init.ones_(module.weight)
+        nn.init.zeros_(module.bias)
+    elif zero_init_last and hasattr(module, 'zero_init_last'):
+        module.zero_init_last()
+
+
+@torch.no_grad()
+def _load_weights(model: nn.Module, checkpoint_path: str, prefix: str = 'resnet/'):
+    import numpy as np
+
+    def t2p(conv_weights):
+        """Possibly convert HWIO to OIHW."""
+        if conv_weights.ndim == 4:
+            conv_weights = conv_weights.transpose([3, 2, 0, 1])
+        return torch.from_numpy(conv_weights)
+
+    weights = np.load(checkpoint_path)
+    stem_conv_w = adapt_input_conv(
+        model.stem.conv.weight.shape[1], t2p(weights[f'{prefix}root_block/standardized_conv2d/kernel']))
+    model.stem.conv.weight.copy_(stem_conv_w)
+    model.norm.weight.copy_(t2p(weights[f'{prefix}group_norm/gamma']))
+    model.norm.bias.copy_(t2p(weights[f'{prefix}group_norm/beta']))
+    if isinstance(getattr(model.head, 'fc', None), nn.Conv2d) and \
+            model.head.fc.weight.shape[0] == weights[f'{prefix}head/conv2d/kernel'].shape[-1]:
+        model.head.fc.weight.copy_(t2p(weights[f'{prefix}head/conv2d/kernel']))
+        model.head.fc.bias.copy_(t2p(weights[f'{prefix}head/conv2d/bias']))
+    for i, (sname, stage) in enumerate(model.stages.named_children()):
+        for j, (bname, block) in enumerate(stage.blocks.named_children()):
+            cname = 'standardized_conv2d'
+            block_prefix = f'{prefix}block{i + 1}/unit{j + 1:02d}/'
+            block.conv1.weight.copy_(t2p(weights[f'{block_prefix}a/{cname}/kernel']))
+            block.conv2.weight.copy_(t2p(weights[f'{block_prefix}b/{cname}/kernel']))
+            block.conv3.weight.copy_(t2p(weights[f'{block_prefix}c/{cname}/kernel']))
+            block.norm1.weight.copy_(t2p(weights[f'{block_prefix}a/group_norm/gamma']))
+            block.norm2.weight.copy_(t2p(weights[f'{block_prefix}b/group_norm/gamma']))
+            block.norm3.weight.copy_(t2p(weights[f'{block_prefix}c/group_norm/gamma']))
+            block.norm1.bias.copy_(t2p(weights[f'{block_prefix}a/group_norm/beta']))
+            block.norm2.bias.copy_(t2p(weights[f'{block_prefix}b/group_norm/beta']))
+            block.norm3.bias.copy_(t2p(weights[f'{block_prefix}c/group_norm/beta']))
+            if block.downsample is not None:
+                w = weights[f'{block_prefix}a/proj/{cname}/kernel']
+                block.downsample.conv.weight.copy_(t2p(w))
 
 
 def _create_resnetv2(variant, pretrained=False, **kwargs):
-    # FIXME feature map extraction is not setup properly for pre-activation mode right now
-    preact = kwargs.get('preact', True)
     feature_cfg = dict(flatten_sequential=True)
-    if preact:
-        feature_cfg['feature_cls'] = 'hook'
-        feature_cfg['out_indices'] = (1, 2, 3, 4)  # no stride 2, 0 level feat for preact
-
     return build_model_with_cfg(
-        ResNetV2, variant, pretrained, default_cfg=default_cfgs[variant], pretrained_custom_load=True,
-        feature_cfg=feature_cfg, **kwargs)
+        ResNetV2, variant, pretrained,
+        feature_cfg=feature_cfg,
+        pretrained_custom_load='_bit' in variant,
+        **kwargs)
+
+
+def _create_resnetv2_bit(variant, pretrained=False, **kwargs):
+    return _create_resnetv2(
+        variant, pretrained=pretrained, stem_type='fixed',  conv_layer=partial(StdConv2d, eps=1e-8), **kwargs)
 
 
 @register_model
 def resnetv2_50x1_bitm(pretrained=False, **kwargs):
-    return _create_resnetv2(
-        'resnetv2_50x1_bitm', pretrained=pretrained,
-        layers=[3, 4, 6, 3], width_factor=1, stem_type='fixed', **kwargs)
+    return _create_resnetv2_bit(
+        'resnetv2_50x1_bitm', pretrained=pretrained, layers=[3, 4, 6, 3], width_factor=1, **kwargs)
 
 
 @register_model
 def resnetv2_50x3_bitm(pretrained=False, **kwargs):
-    return _create_resnetv2(
-        'resnetv2_50x3_bitm', pretrained=pretrained,
-        layers=[3, 4, 6, 3], width_factor=3, stem_type='fixed', **kwargs)
+    return _create_resnetv2_bit(
+        'resnetv2_50x3_bitm', pretrained=pretrained, layers=[3, 4, 6, 3], width_factor=3, **kwargs)
 
 
 @register_model
 def resnetv2_101x1_bitm(pretrained=False, **kwargs):
-    return _create_resnetv2(
-        'resnetv2_101x1_bitm', pretrained=pretrained,
-        layers=[3, 4, 23, 3], width_factor=1, stem_type='fixed', **kwargs)
+    return _create_resnetv2_bit(
+        'resnetv2_101x1_bitm', pretrained=pretrained, layers=[3, 4, 23, 3], width_factor=1, **kwargs)
 
 
 @register_model
 def resnetv2_101x3_bitm(pretrained=False, **kwargs):
-    return _create_resnetv2(
-        'resnetv2_101x3_bitm', pretrained=pretrained,
-        layers=[3, 4, 23, 3], width_factor=3, stem_type='fixed', **kwargs)
+    return _create_resnetv2_bit(
+        'resnetv2_101x3_bitm', pretrained=pretrained, layers=[3, 4, 23, 3], width_factor=3, **kwargs)
 
 
 @register_model
 def resnetv2_152x2_bitm(pretrained=False, **kwargs):
-    return _create_resnetv2(
-        'resnetv2_152x2_bitm', pretrained=pretrained,
-        layers=[3, 8, 36, 3], width_factor=2, stem_type='fixed', **kwargs)
+    return _create_resnetv2_bit(
+        'resnetv2_152x2_bitm', pretrained=pretrained, layers=[3, 8, 36, 3], width_factor=2, **kwargs)
 
 
 @register_model
 def resnetv2_152x4_bitm(pretrained=False, **kwargs):
-    return _create_resnetv2(
-        'resnetv2_152x4_bitm', pretrained=pretrained,
-        layers=[3, 8, 36, 3], width_factor=4, stem_type='fixed', **kwargs)
+    return _create_resnetv2_bit(
+        'resnetv2_152x4_bitm', pretrained=pretrained, layers=[3, 8, 36, 3], width_factor=4, **kwargs)
 
 
 @register_model
 def resnetv2_50x1_bitm_in21k(pretrained=False, **kwargs):
-    return _create_resnetv2(
+    return _create_resnetv2_bit(
         'resnetv2_50x1_bitm_in21k', pretrained=pretrained, num_classes=kwargs.pop('num_classes', 21843),
-        layers=[3, 4, 6, 3], width_factor=1, stem_type='fixed', **kwargs)
+        layers=[3, 4, 6, 3], width_factor=1, **kwargs)
 
 
 @register_model
 def resnetv2_50x3_bitm_in21k(pretrained=False, **kwargs):
-    return _create_resnetv2(
+    return _create_resnetv2_bit(
         'resnetv2_50x3_bitm_in21k', pretrained=pretrained, num_classes=kwargs.pop('num_classes', 21843),
-        layers=[3, 4, 6, 3], width_factor=3, stem_type='fixed', **kwargs)
+        layers=[3, 4, 6, 3], width_factor=3, **kwargs)
 
 
 @register_model
 def resnetv2_101x1_bitm_in21k(pretrained=False, **kwargs):
     return _create_resnetv2(
         'resnetv2_101x1_bitm_in21k', pretrained=pretrained, num_classes=kwargs.pop('num_classes', 21843),
-        layers=[3, 4, 23, 3], width_factor=1, stem_type='fixed', **kwargs)
+        layers=[3, 4, 23, 3], width_factor=1, **kwargs)
 
 
 @register_model
 def resnetv2_101x3_bitm_in21k(pretrained=False, **kwargs):
-    return _create_resnetv2(
+    return _create_resnetv2_bit(
         'resnetv2_101x3_bitm_in21k', pretrained=pretrained, num_classes=kwargs.pop('num_classes', 21843),
-        layers=[3, 4, 23, 3], width_factor=3, stem_type='fixed', **kwargs)
+        layers=[3, 4, 23, 3], width_factor=3, **kwargs)
 
 
 @register_model
 def resnetv2_152x2_bitm_in21k(pretrained=False, **kwargs):
-    return _create_resnetv2(
+    return _create_resnetv2_bit(
         'resnetv2_152x2_bitm_in21k', pretrained=pretrained, num_classes=kwargs.pop('num_classes', 21843),
-        layers=[3, 8, 36, 3], width_factor=2, stem_type='fixed', **kwargs)
+        layers=[3, 8, 36, 3], width_factor=2, **kwargs)
 
 
 @register_model
 def resnetv2_152x4_bitm_in21k(pretrained=False, **kwargs):
-    return _create_resnetv2(
+    return _create_resnetv2_bit(
         'resnetv2_152x4_bitm_in21k', pretrained=pretrained, num_classes=kwargs.pop('num_classes', 21843),
-        layers=[3, 8, 36, 3], width_factor=4, stem_type='fixed', **kwargs)
+        layers=[3, 8, 36, 3], width_factor=4, **kwargs)
 
 
-# NOTE the 'S' versions of the model weights arent as interesting as original 21k or transfer to 1K M.
+@register_model
+def resnetv2_50x1_bit_distilled(pretrained=False, **kwargs):
+    """ ResNetV2-50x1-BiT Distilled
+    Paper: Knowledge distillation: A good teacher is patient and consistent - https://arxiv.org/abs/2106.05237
+    """
+    return _create_resnetv2_bit(
+        'resnetv2_50x1_bit_distilled', pretrained=pretrained, layers=[3, 4, 6, 3], width_factor=1, **kwargs)
 
-# @register_model
-# def resnetv2_50x1_bits(pretrained=False, **kwargs):
-#     return _create_resnetv2(
-#         'resnetv2_50x1_bits', pretrained=pretrained,
-#         layers=[3, 4, 6, 3], width_factor=1, stem_type='fixed', **kwargs)
-#
-#
-# @register_model
-# def resnetv2_50x3_bits(pretrained=False, **kwargs):
-#     return _create_resnetv2(
-#         'resnetv2_50x3_bits', pretrained=pretrained,
-#         layers=[3, 4, 6, 3], width_factor=3, stem_type='fixed', **kwargs)
-#
-#
-# @register_model
-# def resnetv2_101x1_bits(pretrained=False, **kwargs):
-#     return _create_resnetv2(
-#         'resnetv2_101x1_bits', pretrained=pretrained,
-#         layers=[3, 4, 23, 3], width_factor=1, stem_type='fixed', **kwargs)
-#
-#
-# @register_model
-# def resnetv2_101x3_bits(pretrained=False, **kwargs):
-#     return _create_resnetv2(
-#         'resnetv2_101x3_bits', pretrained=pretrained,
-#         layers=[3, 4, 23, 3], width_factor=3, stem_type='fixed', **kwargs)
-#
-#
-# @register_model
-# def resnetv2_152x2_bits(pretrained=False, **kwargs):
-#     return _create_resnetv2(
-#         'resnetv2_152x2_bits', pretrained=pretrained,
-#         layers=[3, 8, 36, 3], width_factor=2, stem_type='fixed', **kwargs)
-#
-#
-# @register_model
-# def resnetv2_152x4_bits(pretrained=False, **kwargs):
-#     return _create_resnetv2(
-#         'resnetv2_152x4_bits', pretrained=pretrained,
-#         layers=[3, 8, 36, 3], width_factor=4, stem_type='fixed', **kwargs)
-#
+
+@register_model
+def resnetv2_152x2_bit_teacher(pretrained=False, **kwargs):
+    """ ResNetV2-152x2-BiT Teacher
+    Paper: Knowledge distillation: A good teacher is patient and consistent - https://arxiv.org/abs/2106.05237
+    """
+    return _create_resnetv2_bit(
+        'resnetv2_152x2_bit_teacher', pretrained=pretrained, layers=[3, 8, 36, 3], width_factor=2, **kwargs)
+
+
+@register_model
+def resnetv2_152x2_bit_teacher_384(pretrained=False, **kwargs):
+    """ ResNetV2-152xx-BiT Teacher @ 384x384
+    Paper: Knowledge distillation: A good teacher is patient and consistent - https://arxiv.org/abs/2106.05237
+    """
+    return _create_resnetv2_bit(
+        'resnetv2_152x2_bit_teacher_384', pretrained=pretrained, layers=[3, 8, 36, 3], width_factor=2, **kwargs)
+
+
+@register_model
+def resnetv2_50(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_50', pretrained=pretrained,
+        layers=[3, 4, 6, 3], conv_layer=create_conv2d, norm_layer=BatchNormAct2d, **kwargs)
+
+
+@register_model
+def resnetv2_50d(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_50d', pretrained=pretrained,
+        layers=[3, 4, 6, 3], conv_layer=create_conv2d, norm_layer=BatchNormAct2d,
+        stem_type='deep', avg_down=True, **kwargs)
+
+
+@register_model
+def resnetv2_50t(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_50t', pretrained=pretrained,
+        layers=[3, 4, 6, 3], conv_layer=create_conv2d, norm_layer=BatchNormAct2d,
+        stem_type='tiered', avg_down=True, **kwargs)
+
+
+@register_model
+def resnetv2_101(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_101', pretrained=pretrained,
+        layers=[3, 4, 23, 3], conv_layer=create_conv2d, norm_layer=BatchNormAct2d, **kwargs)
+
+
+@register_model
+def resnetv2_101d(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_101d', pretrained=pretrained,
+        layers=[3, 4, 23, 3], conv_layer=create_conv2d, norm_layer=BatchNormAct2d,
+        stem_type='deep', avg_down=True, **kwargs)
+
+
+@register_model
+def resnetv2_152(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_152', pretrained=pretrained,
+        layers=[3, 8, 36, 3], conv_layer=create_conv2d, norm_layer=BatchNormAct2d, **kwargs)
+
+
+@register_model
+def resnetv2_152d(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_152d', pretrained=pretrained,
+        layers=[3, 8, 36, 3], conv_layer=create_conv2d, norm_layer=BatchNormAct2d,
+        stem_type='deep', avg_down=True, **kwargs)
+
+
+# Experimental configs (may change / be removed)
+
+@register_model
+def resnetv2_50d_gn(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_50d_gn', pretrained=pretrained,
+        layers=[3, 4, 6, 3], conv_layer=create_conv2d, norm_layer=GroupNormAct,
+        stem_type='deep', avg_down=True, **kwargs)
+
+
+@register_model
+def resnetv2_50d_evob(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_50d_evob', pretrained=pretrained,
+        layers=[3, 4, 6, 3], conv_layer=create_conv2d, norm_layer=EvoNorm2dB0,
+        stem_type='deep', avg_down=True, zero_init_last=True, **kwargs)
+
+
+@register_model
+def resnetv2_50d_evos(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_50d_evos', pretrained=pretrained,
+        layers=[3, 4, 6, 3], conv_layer=create_conv2d, norm_layer=EvoNorm2dS0,
+        stem_type='deep', avg_down=True, **kwargs)
+
+
+@register_model
+def resnetv2_50d_frn(pretrained=False, **kwargs):
+    return _create_resnetv2(
+        'resnetv2_50d_frn', pretrained=pretrained,
+        layers=[3, 4, 6, 3], conv_layer=create_conv2d, norm_layer=FilterResponseNormTlu2d,
+        stem_type='deep', avg_down=True, **kwargs)
